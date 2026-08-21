@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use png::BitDepth;
 
-use rustt::ghg::Parsed;
+use rustt::ghg::{decode_vertex_layout, uv_offset};
 
 fn save_png(path: &str, w: usize, h: usize, rgba: &[u8]) -> Result<()> {
     let mut enc = png::Encoder::new(std::fs::File::create(path)?, w as u32, h as u32);
@@ -176,7 +176,7 @@ fn main() -> Result<()> {
 
     if let Some(a) = args.iter().position(|x| x == "--mesh") {
         let idx = args.get(a + 1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-        let md = rustt::glb::build_mesh(&parsed, idx);
+        let md = rustt::glb::build_mesh(&parsed, idx, 0);
         println!("part {idx}: {} verts, {} tris", md.pos.len(), md.idx.len() / 3);
         let mut mn = [f32::INFINITY; 3];
         let mut mx = [f32::NEG_INFINITY; 3];
@@ -265,7 +265,7 @@ fn main() -> Result<()> {
             if p.dynamic_buffers.is_empty() {
                 continue;
             }
-            let md = rustt::glb::build_mesh(&parsed, i);
+            let md = rustt::glb::build_mesh(&parsed, i, 0);
             if md.pos.len() != p.num_v {
                 println!("part {i}: base mesh has {} verts, part expects {}; skipping", md.pos.len(), p.num_v);
                 continue;
@@ -311,7 +311,7 @@ fn main() -> Result<()> {
         let slot = num(1).unwrap_or(0.0) as usize;
         let (ymin, ymax) = (num(2).unwrap_or(f32::NEG_INFINITY), num(3).unwrap_or(f32::INFINITY));
         let p = parsed.parts.get(part).context("part out of range")?;
-        let md = rustt::glb::build_mesh(&parsed, part);
+        let md = rustt::glb::build_mesh(&parsed, part, 0);
         let Some(d) = p.dynamic_buffers.get(slot) else {
             anyhow::bail!("slot {slot} out of range for part {part}");
         };
@@ -514,7 +514,10 @@ fn main() -> Result<()> {
 
     println!("=== parts (raw, untransformed) ===");
     for (i, p) in parsed.parts.iter().enumerate() {
-        let md = rustt::glb::build_mesh(&parsed, i);
+        let vf = parsed.render.iter().find(|r| r.part == i)
+            .and_then(|r| parsed.materials.get(r.mat as usize))
+            .map(|m| m.vertex_format_bits).unwrap_or(0);
+        let md = rustt::glb::build_mesh(&parsed, i, vf);
         let mut min = [f32::INFINITY; 3];
         let mut max = [f32::NEG_INFINITY; 3];
         let mut centroid = [0.0f32; 3];
@@ -560,7 +563,8 @@ fn main() -> Result<()> {
 
     println!("=== render items transformed by bone world ===");
     for (i, r) in parsed.render.iter().enumerate() {
-        let md = rustt::glb::build_mesh(&parsed, r.part);
+        let vf = parsed.materials.get(r.mat as usize).map(|m| m.vertex_format_bits).unwrap_or(0);
+        let md = rustt::glb::build_mesh(&parsed, r.part, vf);
         if md.pos.is_empty() {
             continue;
         }
@@ -597,7 +601,8 @@ fn main() -> Result<()> {
         .map(|t| rustt::dxt::decode(t).ok())
         .collect();
     for (i, r) in parsed.render.iter().enumerate() {
-        let md = rustt::glb::build_mesh(&parsed, r.part);
+        let vf = parsed.materials.get(r.mat as usize).map(|m| m.vertex_format_bits).unwrap_or(0);
+        let md = rustt::glb::build_mesh(&parsed, r.part, vf);
         if md.pos.is_empty() || md.uv.is_empty() {
             println!("item {i}: part={} no mesh", r.part);
             continue;
@@ -665,17 +670,71 @@ fn main() -> Result<()> {
         } else {
             "no texture".into()
         };
+        let stride_uvo = uv_offset(parsed.parts[r.part].stride);
+        let vf = parsed.materials.get(r.mat as usize).map(|m| m.vertex_format_bits).unwrap_or(0);
+        let layout_uvo = decode_vertex_layout(vf).uv_offset;
         println!(
-            "item {i}: part={} mat={} tex={t} {tw}x{th} stride={} {s} uv=[{:.3},{:.3}]-[{:.3},{:.3}] oob={out_of_range}/{tris} finite={finite}/{tris}",
-            r.part, r.mat, parsed.parts[r.part].stride, uv_min[0], uv_min[1], uv_max[0], uv_max[1]
+            "item {i}: part={} mat={} tex={t} {tw}x{th} stride={} stride_uvo={:?} layout_uvo={:?} {s} uv=[{:.3},{:.3}]-[{:.3},{:.3}] oob={out_of_range}/{tris} finite={finite}/{tris}",
+            r.part, r.mat, parsed.parts[r.part].stride, stride_uvo, layout_uvo, uv_min[0], uv_min[1], uv_max[0], uv_max[1]
         );
     }
     println!();
 
+    // Boundary check: find vertices in parts 34 & 35 that share positions (Qui-Gon hair)
+    if parsed.parts.len() > 35 {
+        use std::collections::HashMap;
+        let eps = 1e-4f32;
+        let quant = |v: [f32; 3]| -> (i32, i32, i32) {
+            ((v[0] / eps).round() as i32, (v[1] / eps).round() as i32, (v[2] / eps).round() as i32)
+        };
+        let mut pos_map: HashMap<(i32,i32,i32), Vec<(usize, [f32; 2])>> = HashMap::new();
+        let mut verts_34: Vec<([f32; 3], [f32; 2])> = Vec::new();
+        let mut verts_35: Vec<([f32; 3], [f32; 2])> = Vec::new();
+        for &part_idx in &[34usize, 35usize] {
+            let p = &parsed.parts[part_idx];
+            let vf = parsed.render.iter().find(|r| r.part == part_idx)
+                .and_then(|r| parsed.materials.get(r.mat as usize))
+                .map(|m| m.vertex_format_bits).unwrap_or(0);
+            let md = rustt::glb::build_mesh(&parsed, part_idx, vf);
+            let vec = if part_idx == 34 { &mut verts_34 } else { &mut verts_35 };
+            for (vi, (pos, uv)) in md.pos.iter().zip(md.uv.iter()).enumerate() {
+                vec.push((*pos, *uv));
+                let q = quant(*pos);
+                pos_map.entry(q).or_default().push((part_idx, *uv));
+            }
+        }
+        let mut shared = 0usize;
+        let mut uv_mismatch = 0usize;
+        let mut uv_mismatch_examples: Vec<(usize, usize, [f32; 3], [f32; 2], [f32; 2])> = Vec::new();
+        for (_q, entries) in &pos_map {
+            let has_34 = entries.iter().any(|(p, _)| *p == 34);
+            let has_35 = entries.iter().any(|(p, _)| *p == 35);
+            if has_34 && has_35 {
+                shared += 1;
+                let uv34 = entries.iter().find(|(p, _)| *p == 34).unwrap().1;
+                let uv35 = entries.iter().find(|(p, _)| *p == 35).unwrap().1;
+                if (uv34[0] - uv35[0]).abs() > 0.001 || (uv34[1] - uv35[1]).abs() > 0.001 {
+                    uv_mismatch += 1;
+                    if uv_mismatch_examples.len() < 5 {
+                        let v34 = verts_34.iter().find(|(p, u)| *u == uv34).unwrap();
+                        uv_mismatch_examples.push((34, 35, v34.0, uv34, uv35));
+                    }
+                }
+            }
+        }
+        println!("=== hair boundary (parts 34 vs 35) ===");
+        println!("shared positions: {shared}, UV mismatches: {uv_mismatch}");
+        for (a, b, pos, uva, uvb) in &uv_mismatch_examples {
+            println!("  pos=[{:.4},{:.4},{:.4}] part{a}_uv=[{:.4},{:.4}] part{b}_uv=[{:.4},{:.4}]",
+                pos[0], pos[1], pos[2], uva[0], uva[1], uvb[0], uvb[1]);
+        }
+        println!("=== end boundary ===");
+    }
+
     println!("=== raw vertex floats (v0 then v1) ===");
     for (pi, p) in parsed.parts.iter().enumerate() {
-        if pi > 9 {
-            break;
+        if pi > 9 && pi != 34 && pi != 35 {
+            continue;
         }
         let vl = parsed.vertex_lists[p.vl];
         let base = p.off_v * p.stride;
@@ -693,8 +752,9 @@ fn main() -> Result<()> {
 
     println!("=== materials ===");
     for (i, m) in parsed.materials.iter().enumerate() {
+        let vl = decode_vertex_layout(m.vertex_format_bits);
         println!(
-            "mat {i}: id={} tex={} rgba={:02x}{:02x}{:02x}{:02x} diff=({:.2},{:.2},{:.2},{:.2}) lighting={} defines={:#010x} spec={} norm={} cube={} specExp={:.1} specMult={:.2} refl={:.2} fres=({:.2},{:.2})",
+            "mat {i}: id={} tex={} rgba={:02x}{:02x}{:02x}{:02x} diff=({:.2},{:.2},{:.2},{:.2}) lighting={} defines={:#010x} spec={} norm={} cube={} specExp={:.1} specMult={:.2} refl={:.2} fres=({:.2},{:.2}) vf=0x{:08x} vl.uv={:?} vl.tan={:?}",
             m.id,
             m.tex_id,
             m.rgba[0],
@@ -736,6 +796,9 @@ fn main() -> Result<()> {
             m.reflection_power,
             m.specular_params[2],
             m.specular_params[3],
+            m.vertex_format_bits,
+            vl.uv_offset,
+            vl.tangent_offset,
         );
     }
     println!(

@@ -2098,27 +2098,7 @@ fn build_materials(
         cpu_parts.push(CpuPart { md, part_idx: i, material: part.material, transparent, blend_mode, depth_mode });
     }
 
-    // --- Snap: merge vertices across meshes that are within a tiny threshold ---
-    // Closes the sub-unit gaps the original engine welds at load time.
-    let snap_threshold: f32 = std::env::var("SNAP_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.005);
-    if snap_threshold > 0.0 {
-        let mut mesh_vecs: Vec<rustt::glb::MeshData> = cpu_parts.iter_mut().map(|c| {
-            // Swap out the MeshData, snap it in-place, then swap back.
-            std::mem::replace(&mut c.md, rustt::glb::MeshData {
-                pos: vec![], nrm: vec![], uv: vec![], lm_uv: vec![],
-                color: vec![], tangent: vec![], idx: vec![], skin: vec![], skin_bones: vec![],
-            })
-        }).collect();
-        rustt::mapmesh::snap_close_vertices(&mut mesh_vecs, snap_threshold);
-        for (cp, md) in cpu_parts.iter_mut().zip(mesh_vecs) {
-            cp.md = md;
-        }
-    }
-
-    // --- Pass 2: create GPU buffers from the (possibly snapped) data ----
+    // --- Pass 2: create GPU buffers from the CPU-side data ----
     let mut out = Vec::new();
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
@@ -2262,6 +2242,23 @@ fn build_materials(
         } else {
             white_view
         };
+        // Mirror build_materials: EnvMap detection from shader_defines bits
+        // 5-6 == 1 (Cube) AND a valid cubemap ID. When the specular and
+        // cubemap slots point at the same texture, the specular sample reads
+        // the sky image through mesh UVs — suppress it (the cubemap path
+        // handles the reflection).
+        let cube_id = m.tex_cubemap;
+        let cube_view = if cube_id >= 0 {
+            map.tex_slot(cube_id as i16)
+                .filter(|&s| s < textures.len())
+                .map(|s| view_at(s as i32))
+                .unwrap_or(white_view)
+        } else {
+            white_view
+        };
+        let envmap_type = (m.shader_defines >> 5) & 0x03;
+        let has_cubemap = if envmap_type == 1 && cube_id >= 0 && map.tex_slot(cube_id as i16).is_some() { 1 } else { 0 };
+        let has_specular = if has_cubemap == 1 && spec_id == cube_id { 0 } else { 1 };
         let uniform = MaterialUniform {
             base_color: [m.diffuse[0], m.diffuse[1], m.diffuse[2], 1.0],
             has_tex,
@@ -2277,9 +2274,9 @@ fn build_materials(
             alpha_cutoff: 0.0,
             lm_bits: [x.to_bits(), y.to_bits(), sz.to_bits(), sw.to_bits()],
             has_normal: if norm_id >= 0 && map.tex_slot(norm_id as i16).is_some() { 1 } else { 0 },
-            has_specular: if spec_id >= 0 && map.tex_slot(spec_id as i16).is_some() { 1 } else { 0 },
-            has_cubemap: 0,
-            reflection_power: 0.0,
+            has_specular,
+            has_cubemap,
+            reflection_power: m.specular_params[1],
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("map lightmap uniform"),
@@ -2330,7 +2327,7 @@ fn build_materials(
                 },
                 wgpu::BindGroupEntry {
                     binding: 9,
-                    resource: wgpu::BindingResource::TextureView(&white_view),
+                    resource: wgpu::BindingResource::TextureView(cube_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 10,

@@ -76,8 +76,12 @@ pub fn build_mesh(p: &Parsed, part_idx: usize, vertex_format_bits: u32) -> MeshD
     if base + n * part.stride > vl.len() {
         return empty;
     }
-    let uvo = uv_offset(part.stride).or_else(|| scan_uv(vl, base, n, part.stride));
     let vlayout = decode_vertex_layout(vertex_format_bits);
+    // Prefer the vfbits-decoded UV offset; fall back to the stride table
+    // (for MAP vertices that lack vertex_format_bits), then scan heuristic.
+    let uvo = vlayout.uv_offset
+        .or_else(|| uv_offset(part.stride))
+        .or_else(|| scan_uv(vl, base, n, part.stride));
     // Prefer the decoded tangent offset; fall back to heuristic for MAP vertices.
     let tao = vlayout.tangent_offset;
 
