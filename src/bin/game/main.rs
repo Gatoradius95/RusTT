@@ -1723,7 +1723,7 @@ impl App {
             println!("hidden {} room geometry copies of buildit sub-objects", to_hide.len());
         }
 
-        let buildit_particles = particles::BuilditParticles::new(&gpu.device, gpu.config.format);
+        let buildit_particles = particles::BuilditParticles::new(&gpu.device, &gpu.queue, gpu.config.format);
 
         Ok(AppWindow {
             window,
