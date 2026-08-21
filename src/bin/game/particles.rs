@@ -74,10 +74,20 @@ struct VertexOutput {
 @vertex
 fn vs_particle(in: VertexInput) -> VertexOutput {
     let center = u_cam.view_proj * vec4<f32>(in.a_pos, 1.0);
-    let size = 0.12;
     var out: VertexOutput;
-    out.v_pos = center + vec4<f32>(in.a_quad * size * center.w, 0.0, 0.0);
     out.v_color = in.a_color;
+    // Billboard in clip space. `center.w` is negative or ~0 (particle at/behind
+    // the camera plane), scaling the quad by it sends the clip-space corner to
+    // infinity and a single spawned particle flashes a full-screen polygon.
+    // Collapse such particles to an off-screen point so they are clipped away.
+    if center.w <= 0.001 {
+        out.v_pos = vec4<f32>(-2.0, -2.0, 0.0, 1.0);
+        return out;
+    }
+    // Constant world-size billboard: offset NDC by `size` after the divide,
+    // which in clip space is `size * center.w`.
+    let size = 0.12;
+    out.v_pos = center + vec4<f32>(in.a_quad * size * center.w, 0.0, 0.0);
     return out;
 }
 
@@ -374,6 +384,7 @@ fn rand_f32() -> f32 {
     SEED.with(|s| {
         let v = s.get().wrapping_mul(6364136223846793005).wrapping_add(1);
         s.set(v);
-        (v >> 16) as f32 / (u32::MAX >> 16) as f32
+        // Take the top 16 bits of the 64-bit LCG and normalize to [0,1].
+        ((v >> 48) as u16) as f32 / u16::MAX as f32
     })
 }

@@ -2258,7 +2258,10 @@ fn build_materials(
         };
         let envmap_type = (m.shader_defines >> 5) & 0x03;
         let has_cubemap = if envmap_type == 1 && cube_id >= 0 && map.tex_slot(cube_id as i16).is_some() { 1 } else { 0 };
-        let has_specular = if has_cubemap == 1 && spec_id == cube_id { 0 } else { 1 };
+        // Specular only when a specular texture is bound; suppressed when it
+        // aliases the cubemap (the reflection path owns that sample).
+        let spec_ok = spec_id >= 0 && map.tex_slot(spec_id as i16).is_some();
+        let has_specular = if has_cubemap == 1 && spec_id == cube_id { 0 } else { spec_ok as u32 };
         let uniform = MaterialUniform {
             base_color: [m.diffuse[0], m.diffuse[1], m.diffuse[2], 1.0],
             has_tex,
