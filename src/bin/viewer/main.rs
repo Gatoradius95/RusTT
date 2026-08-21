@@ -1,4 +1,5 @@
 mod camera;
+mod imgui_state;
 mod renderer;
 mod scene;
 
@@ -8,8 +9,155 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use imgui::{Condition, FontSource, Image, TreeNodeFlags};
-use imgui_winit_support::{HiDpiMode, WinitPlatform};
+use imgui::{Condition, Image, TreeNodeFlags};
+
+use imgui_state::ImguiState;
+
+/// Copy a rendered texture to a PNG (VIEWER_SHOT debug aid).
+fn capture_texture(gpu: &GpuRenderer, tex: &wgpu::Texture, path: &str) -> Result<()> {
+    let w = gpu.config.width.max(1);
+    let h = gpu.config.height.max(1);
+    let bytes_per_row = w as usize * 4;
+    let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("screenshot staging"),
+        size: (bytes_per_row * h as usize) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row as u32),
+                rows_per_image: Some(h),
+            },
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    gpu.queue.submit(Some(encoder.finish()));
+
+    let slice = buffer.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        tx.send(r).expect("map_async receiver");
+    });
+    gpu.device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    rx.recv().context("map_async")??;
+
+    let raw = slice.get_mapped_range();
+    let mut rgba: Vec<u8> = raw.to_vec();
+    drop(raw);
+    buffer.unmap();
+    // Swapchain/offscreen targets are BGRA on Windows; the png encoder writes
+    // RGB, so flip the channels back.
+    let bgra = matches!(
+        tex.format(),
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+    );
+    if bgra {
+        for px in rgba.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+    }
+    let mut out = std::fs::File::create(path).context("creating shot file")?;
+    let mut enc = png::Encoder::new(&mut out, w, h);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().context("png header")?;
+    writer.write_image_data(&rgba).context("png data")?;
+
+    // Quick luminance stats so automation can tell lit from fullbright.
+    let mut sum = 0.0f64;
+    let mut bright = 0usize;
+    let mut dark = 0usize;
+    let mut bands = [0usize; 4];
+    let mut total = 0usize;
+    for px in rgba.chunks_exact(4) {
+        let l = 0.2126 * px[0] as f64 + 0.7152 * px[1] as f64 + 0.0722 * px[2] as f64;
+        sum += l;
+        if l > 0.9 * 255.0 {
+            bright += 1;
+        }
+        if l < 0.03 * 255.0 {
+            dark += 1;
+        }
+        let b = ((l / 64.0).floor() as usize).min(3);
+        bands[b] += 1;
+        total += 1;
+    }
+    let mean = sum / total.max(1) as f64;
+    eprintln!(
+        "shot stats: meanL={mean:.1}/255 ({:.0}% of max) bright>230={:.1}% dark<8={:.1}% bands<64:{:.0}% <128:{:.0}% <192:{:.0}% >=192:{:.0}%",
+        mean / 255.0 * 100.0,
+        bright as f64 / total.max(1) as f64 * 100.0,
+        dark as f64 / total.max(1) as f64 * 100.0,
+        bands[0] as f64 / total.max(1) as f64 * 100.0,
+        (bands[0] + bands[1]) as f64 / total.max(1) as f64 * 100.0,
+        (bands[0] + bands[1] + bands[2]) as f64 / total.max(1) as f64 * 100.0,
+        bands[3] as f64 / total.max(1) as f64 * 100.0,
+    );
+    // VIEWER_SHOT_REF=<png>: pixel-diff against a reference so shader changes
+    // can be judged even when the aggregate stats barely move.
+    if let Ok(ref_path) = std::env::var("VIEWER_SHOT_REF") {
+        let dec = png::Decoder::new(std::fs::File::open(&ref_path)?);
+        let mut reader = dec.read_info().context("ref png header")?;
+        let mut ref_rgba = vec![0u8; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut ref_rgba).context("ref png frame")?;
+        let ref_rgba = &ref_rgba[..info.buffer_size()];
+        let rw = info.width as usize;
+        let rh = info.height as usize;
+        let mut changed = 0usize;
+        let mut adiff = 0.0f64;
+        let mut ncmp = 0usize;
+        for y in 0..rh.min(h as usize) {
+            for x in 0..rw.min(w as usize) {
+                let a = (y * w as usize + x) * 4;
+                let b = (y * rw + x) * 4;
+                let la = 0.2126 * rgba[a] as f64 + 0.7152 * rgba[a + 1] as f64 + 0.0722 * rgba[a + 2] as f64;
+                let lb = 0.2126 * ref_rgba[b] as f64 + 0.7152 * ref_rgba[b + 1] as f64 + 0.0722 * ref_rgba[b + 2] as f64;
+                if (la - lb).abs() > 2.0 {
+                    changed += 1;
+                }
+                adiff += (la - lb).abs();
+                ncmp += 1;
+            }
+        }
+        eprintln!(
+            "shot diff vs {ref_path}: changed>2/255: {:.1}% mean|dl|={:.2}",
+            changed as f64 / ncmp.max(1) as f64 * 100.0,
+            adiff / ncmp.max(1) as f64
+        );
+    }
+    Ok(())
+}
+
+/// Copy the just-presented swapchain image to a PNG (mirroring the game
+/// client's capture_surface).
+fn capture_surface(
+    gpu: &GpuRenderer,
+    frame: &wgpu::SurfaceTexture,
+    path: &str,
+) -> Result<()> {
+    capture_texture(gpu, &frame.texture, path)
+}
+
 use renderer::GpuRenderer;
 use winit::{
     application::ApplicationHandler,
@@ -25,6 +173,7 @@ use rustt::an3::An3;
 use rustt::bsa::Bsa;
 use rustt::ghg::Parsed;
 use rustt::map::Map;
+use rustt::rtl::RtlLight;
 
 const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     r: 0.12,
@@ -41,6 +190,7 @@ struct InputState {
     left_down: bool,
     right_down: bool,
     keys: HashSet<KeyCode>,
+    just_pressed: HashSet<KeyCode>,
     want_capture_mouse: bool,
     want_capture_keyboard: bool,
 }
@@ -55,77 +205,10 @@ impl Default for InputState {
             left_down: false,
             right_down: false,
             keys: HashSet::new(),
+            just_pressed: HashSet::new(),
             want_capture_mouse: false,
             want_capture_keyboard: false,
         }
-    }
-}
-
-struct ImguiState {
-    context: imgui::Context,
-    platform: WinitPlatform,
-    renderer: imgui_wgpu::Renderer,
-    last_frame: Instant,
-    last_cursor: Option<imgui::MouseCursor>,
-}
-
-impl ImguiState {
-    fn new(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        format: wgpu::TextureFormat,
-        window: &Window,
-    ) -> Self {
-        let mut context = imgui::Context::create();
-        let mut platform = WinitPlatform::new(&mut context);
-        platform.attach_window(context.io_mut(), window, HiDpiMode::Default);
-        context.set_ini_filename(None);
-
-        let hidpi = window.scale_factor();
-        context.io_mut().font_global_scale = (1.0 / hidpi) as f32;
-        context.fonts().add_font(&[FontSource::DefaultFontData {
-            config: Some(imgui::FontConfig {
-                size_pixels: (13.0 * hidpi) as f32,
-                ..Default::default()
-            }),
-        }]);
-
-        let renderer_config = if format.is_srgb() {
-            imgui_wgpu::RendererConfig {
-                texture_format: format,
-                depth_format: Some(wgpu::TextureFormat::Depth32Float),
-                ..imgui_wgpu::RendererConfig::new()
-            }
-        } else {
-            imgui_wgpu::RendererConfig {
-                texture_format: format,
-                depth_format: Some(wgpu::TextureFormat::Depth32Float),
-                ..imgui_wgpu::RendererConfig::new_srgb()
-            }
-        };
-        let renderer = imgui_wgpu::Renderer::new(&mut context, device, queue, renderer_config);
-
-        Self {
-            context,
-            platform,
-            renderer,
-            last_frame: Instant::now(),
-            last_cursor: None,
-        }
-    }
-
-    fn rebuild_font(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, scale_factor: f64) {
-        self.context.fonts().clear();
-        self.context.fonts().add_font(&[FontSource::DefaultFontData {
-            config: Some(imgui::FontConfig {
-                oversample_h: 1,
-                pixel_snap_h: true,
-                size_pixels: (13.0 * scale_factor) as f32,
-                ..Default::default()
-            }),
-        }]);
-        self.renderer
-            .reload_font_texture(&mut self.context, device, queue);
     }
 }
 
@@ -150,6 +233,15 @@ struct AppWindow {
     anim_idx: usize,
     parsed_rest_locals: Vec<Mat4>,
     anim_frame: f32,
+    /// Frames rendered so far (drives the env-var screenshot below).
+    frames_done: u32,
+    /// Save a PNG after this many frames (VIEWER_SHOT="<frame>:<path>").
+    shot_frame: Option<u32>,
+    shot_path: Option<String>,
+    /// Offscreen render target for headless VIEWER_SHOT captures (rendering
+    /// into the swapchain stalls forever while Windows reports the window
+    /// occluded; the offscreen texture is independent of surface state).
+    headless_view: Option<(wgpu::Texture, wgpu::TextureView)>,
     anim_playing: bool,
     anim_speed: f32,
     anim_cam_framed: bool,
@@ -189,6 +281,8 @@ struct AppModel {
 struct AppMap {
     file_name: String,
     map: Map<'static>,
+    /// Sibling `.RTL` light list for per-mesh lighting; empty when absent.
+    lights: Vec<RtlLight>,
 }
 
 struct App {
@@ -202,6 +296,38 @@ fn texture_preview(ui: &imgui::Ui, id: imgui::TextureId, w: u32, h: u32) {
         .min(128.0 / h.max(1) as f32);
     let size = [w as f32 * scale, h as f32 * scale];
     Image::new(id, size).build(ui);
+}
+
+/// Load the same-named `.RTL` light list next to a `.GSC` map so the viewer
+/// can light each mesh from its own position like the original's per-part
+/// baking. The exact sibling (`MAP_PC.RTL`) may be absent because the light
+/// list is shipped as `MAP.RTL`, so the platform-tagged name is tried first
+/// and the untagged name second. Returns an empty list when neither exists.
+fn load_rtl_sibling(map_path: &str) -> Vec<RtlLight> {
+    for rtl_path in rustt::rtl::sibling_rtl_candidates(map_path) {
+        let Ok(data) = std::fs::read(&rtl_path) else {
+            continue;
+        };
+        let lights = rustt::rtl::parse(&data);
+        println!("load RTL {}: {} lights", rtl_path.display(), lights.len());
+        return lights;
+    }
+    Vec::new()
+}
+
+/// Find a sibling `.GIZ` file next to a `.GSC` path.
+fn find_sibling_giz(gsc_path: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(gsc_path);
+    // Same name but .GIZ extension (e.g. MAP_PC.GSC -> MAP.GIZ).
+    let stem = p.file_stem()?.to_str()?;
+    // Strip _PC suffix to find the base name.
+    let base = stem.strip_suffix("_PC").unwrap_or(stem);
+    let giz = p.with_file_name(format!("{base}.GIZ"));
+    if giz.exists() {
+        Some(giz)
+    } else {
+        None
+    }
 }
 
 /// Load the same-named `.BSA` blend-shape (facial) animation next to an `.AN3`
@@ -402,6 +528,7 @@ fn build_ui(
         }
         if let Some(menu) = ui.begin_menu("View") {
             ui.checkbox("Grid", &mut gpu.show_grid);
+            ui.checkbox("Grid X-ray", &mut gpu.show_grid_xray);
             let wire_supported = gpu.wireframe_supported();
             {
                 let _disabled = ui.begin_disabled(!wire_supported);
@@ -430,6 +557,10 @@ fn build_ui(
             menu.end();
         }
         tb.end();
+    }
+
+    if gpu.show_grid {
+        draw_coord_overlay(ui, camera, gpu);
     }
 
     if *show_scene {
@@ -649,6 +780,7 @@ fn build_map_ui(
         }
         if let Some(menu) = ui.begin_menu("View") {
             ui.checkbox("Grid", &mut gpu.show_grid);
+            ui.checkbox("Grid X-ray", &mut gpu.show_grid_xray);
             let wire_supported = gpu.wireframe_supported();
             {
                 let _disabled = ui.begin_disabled(!wire_supported);
@@ -670,6 +802,10 @@ fn build_map_ui(
             menu.end();
         }
         tb.end();
+    }
+
+    if gpu.show_grid {
+        draw_coord_overlay(ui, camera, gpu);
     }
 
     if *show_scene {
@@ -728,6 +864,17 @@ fn build_map_ui(
                     gpu.scene.set_material_color(&gpu.queue, i, col);
                 }
                 ui.text(format!("tex_id: {}", gpu.scene.materials[i].tex_id));
+                let lighting_name = match gpu.scene.materials[i].lighting_stage {
+                    0 => "unlit",
+                    1 => "lambert",
+                    2 => "gooch",
+                    3 => "envmap",
+                    4 => "aniso",
+                    5 => "aniso_ward",
+                    6 => "phong",
+                    _ => "unknown",
+                };
+                ui.text(format!("lighting: {lighting_name}"));
                 if gpu.scene.materials[i].tex_id >= 0 {
                     let tid = gpu.scene.materials[i].tex_id as usize;
                     if let Some(t) = gpu.scene.textures.get(tid) {
@@ -804,7 +951,9 @@ impl App {
                 &m.file_name,
                 &allowed,
             )?,
-            AppData::Map(m) => GpuRenderer::new_map(event_loop, &window, &m.map, &m.file_name)?,
+            AppData::Map(m) => {
+                GpuRenderer::new_map(event_loop, &window, &m.map, &m.lights, &m.file_name)?
+            }
         };
         let mut imgui = ImguiState::new(&gpu.device, &gpu.queue, gpu.config.format, &window);
 
@@ -813,6 +962,20 @@ impl App {
 
         let mut camera = camera::OrbitCamera::default();
         camera.frame(&gpu.scene.bounds);
+
+        // VIEWER_CAM="tx,ty,tz,yaw,pitch[,distance]": override the framed
+        // camera so headless VIEWER_SHOT captures can target a prop.
+        if let Ok(cv) = std::env::var("VIEWER_CAM") {
+            let v: Vec<f32> = cv.split(',').filter_map(|s| s.parse().ok()).collect();
+            if v.len() >= 5 {
+                camera.target = glam::Vec3::new(v[0], v[1], v[2]);
+                camera.yaw = v[3];
+                camera.pitch = v[4];
+                if v.len() >= 6 {
+                    camera.distance = v[5];
+                }
+            }
+        }
 
         // Play the requested animation (index 0) by default; an auto-loaded
         // IDLE is available via the combo box. `parsed_rest_locals` feeds the
@@ -828,6 +991,35 @@ impl App {
         };
 
         let show_anim = matches!(&self.data, AppData::Model(m) if !m.anims.is_empty());
+
+        let shot = std::env::var("VIEWER_SHOT").ok();
+        let (shot_frame, shot_path) = match shot {
+            Some(s) => {
+                let (n, path) = s.split_once(':').unwrap_or(("30", &s));
+                (n.parse::<u32>().ok(), Some(path.to_owned()))
+            }
+            None => (None, None),
+        };
+        let headless_view = if shot_path.is_some() {
+            let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("headless capture texture"),
+                size: wgpu::Extent3d {
+                    width: gpu.config.width.max(1),
+                    height: gpu.config.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: gpu.config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            Some((tex, view))
+        } else {
+            None
+        };
 
         Ok(AppWindow {
             window,
@@ -848,6 +1040,10 @@ impl App {
             anim_idx,
             parsed_rest_locals,
             anim_frame: 0.0,
+            frames_done: 0,
+            shot_frame,
+            shot_path,
+            headless_view,
             anim_playing: false,
             anim_speed: 1.0,
             anim_cam_framed: false,
@@ -903,6 +1099,7 @@ impl ApplicationHandler for App {
                     match event.state {
                         ElementState::Pressed => {
                             window.input.keys.insert(code);
+                            window.input.just_pressed.insert(code);
                         }
                         ElementState::Released => {
                             window.input.keys.remove(&code);
@@ -952,6 +1149,9 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
+                if window.shot_path.is_some() {
+                    eprintln!("redraw #{}: enter", window.frames_done);
+                }
                 let dt = (now - window.imgui.last_frame).as_secs_f32().min(0.1);
                 window
                     .imgui
@@ -965,21 +1165,25 @@ impl ApplicationHandler for App {
                     return;
                 }
 
-                let frame = match window.gpu.surface.get_current_texture() {
-                    wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-                    wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-                    wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                        return;
-                    }
-                    wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                        window
-                            .gpu
-                            .resize(window.gpu.config.width, window.gpu.config.height);
-                        return;
-                    }
-                    other => {
-                        eprintln!("get_current_texture error: {other:?}");
-                        return;
+                let frame = if window.headless_view.is_some() {
+                    None
+                } else {
+                    match window.gpu.surface.get_current_texture() {
+                        wgpu::CurrentSurfaceTexture::Success(frame) => Some(frame),
+                        wgpu::CurrentSurfaceTexture::Suboptimal(frame) => Some(frame),
+                        wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                            return;
+                        }
+                        wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                            window
+                                .gpu
+                                .resize(window.gpu.config.width, window.gpu.config.height);
+                            return;
+                        }
+                        other => {
+                            eprintln!("get_current_texture error: {other:?}");
+                            return;
+                        }
                     }
                 };
 
@@ -993,6 +1197,10 @@ impl ApplicationHandler for App {
                     camera,
                     input,
                     exit_requested,
+                    frames_done,
+                    shot_frame,
+                    shot_path,
+                    headless_view,
                     show_scene,
                     show_materials,
                     show_bones,
@@ -1038,6 +1246,33 @@ impl ApplicationHandler for App {
                         as f32;
                     camera.move_target(fwd, strafe, up, dt);
                 }
+
+                // 'C' toggles the VIEWER_CULL sphere on/off.
+                if !(input.want_capture_keyboard) && input.just_pressed.contains(&KeyCode::KeyC) {
+                    gpu.cull_enabled = !gpu.cull_enabled;
+                    println!("cull: {}", if gpu.cull_enabled { "ON" } else { "OFF" });
+                }
+                // 'P' toggles color correction (approximate D3D9 sRGB-space look).
+                if !(input.want_capture_keyboard) && input.just_pressed.contains(&KeyCode::KeyP) {
+                    gpu.color_correct_enabled = !gpu.color_correct_enabled;
+                    println!("color_correct: {}", if gpu.color_correct_enabled { "ON" } else { "OFF" });
+                }
+                // 'O' toggles SO/room coloring: green = room geometry, yellow = SO entity.
+                if !(input.want_capture_keyboard) && input.just_pressed.contains(&KeyCode::KeyO) {
+                    gpu.so_coloring_enabled = !gpu.so_coloring_enabled;
+                    println!("so_coloring: {}", if gpu.so_coloring_enabled { "ON" } else { "OFF" });
+                }
+                // '0' toggles cubemap reflections on/off for debugging specular noise.
+                if !(input.want_capture_keyboard) && input.just_pressed.contains(&KeyCode::Digit0) {
+                    gpu.cubemap_enabled = !gpu.cubemap_enabled;
+                    println!("cubemap: {}", if gpu.cubemap_enabled { "ON" } else { "OFF" });
+                }
+                // '1' toggles normal map on/off for debugging specular noise.
+                if !(input.want_capture_keyboard) && input.just_pressed.contains(&KeyCode::Digit1) {
+                    gpu.normal_map_enabled = !gpu.normal_map_enabled;
+                    println!("normal_map: {}", if gpu.normal_map_enabled { "ON" } else { "OFF" });
+                }
+                input.just_pressed.clear();
 
                 if let AppData::Model(m) = &self.data {
                     if let Some(an3) = m.anims.get(*anim_idx) {
@@ -1109,18 +1344,37 @@ impl ApplicationHandler for App {
                     .prepare_frame(imgui.context.io_mut(), win)
                     .expect("prepare_frame failed");
 
-                let view = frame
-                    .texture
-                    .create_view(&wgpu::TextureViewDescriptor::default());
+                let headless = shot_path.is_some();
+
+                let view = match &headless_view {
+                    Some((_, hv)) => hv.clone(),
+                    None => frame
+                        .as_ref()
+                        .expect("surface frame")
+                        .texture
+                        .create_view(&wgpu::TextureViewDescriptor::default()),
+                };
                 let mut encoder = gpu
                     .device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
+                gpu.update_camera(camera);
+
+                let cull: Option<(glam::Vec3, f32)> = if gpu.cull_enabled {
+                    std::env::var("VIEWER_CULL").ok().and_then(|v| {
+                        let p: Vec<f32> = v.split(',').filter_map(|s| s.parse().ok()).collect();
+                        (p.len() >= 4).then(|| (glam::Vec3::new(p[0], p[1], p[2]), p[3]))
+                    })
+                } else {
+                    None
+                };
+
+                // Pass 1: opaque geometry → backbuffer (offscreen), grid too.
                 {
                     let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: None,
+                        label: Some("opaque pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
+                            view: gpu.backbuffer_view(),
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(CLEAR_COLOR),
@@ -1141,8 +1395,59 @@ impl ApplicationHandler for App {
                         multiview_mask: None,
                     });
 
-                    gpu.update_camera(camera);
-                    gpu.draw_scene(&mut rpass);
+                    gpu.draw_scene_opaque_culled(&mut rpass, &gpu.scene, false, cull.as_ref(), &std::collections::HashSet::new());
+                    gpu.draw_grid(&mut rpass);
+                }
+
+                // Copy opaque backbuffer → swapchain so transparent pass
+                // can sample the opaque scene for refraction.
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: gpu.backbuffer_tex(),
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &frame.as_ref().expect("surface frame").texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: gpu.config.width.max(1),
+                        height: gpu.config.height.max(1),
+                        depth_or_array_layers: 1,
+                    },
+                );
+
+                // Pass 2: transparent geometry → swapchain (load opaque + depth).
+                {
+                    let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("transparent pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: gpu.depth_view(),
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+
+                    gpu.draw_scene_transparent_culled(&mut rpass, &gpu.scene, false, cull.as_ref(), &std::collections::HashSet::new());
 
                     {
                         let ui = imgui.context.frame();
@@ -1200,14 +1505,36 @@ impl ApplicationHandler for App {
                     }
 
                     let draw_data = imgui.context.render();
-                    imgui
-                        .renderer
-                        .render(draw_data, &gpu.queue, &gpu.device, &mut rpass)
-                        .expect("imgui render failed");
+                    if !headless {
+                        imgui
+                            .renderer
+                            .render(draw_data, &gpu.queue, &gpu.device, &mut rpass)
+                            .expect("imgui render failed");
+                    }
                 }
 
                 gpu.queue.submit(Some(encoder.finish()));
-                frame.present();
+
+*frames_done += 1;
+                if shot_path.is_some() {
+                    eprintln!("redraw #{frames_done}: drawn");
+                }
+                if *shot_frame == Some(*frames_done) {
+                    if let Some(path) = shot_path {
+                        let res = match &headless_view {
+                            Some((tex, _)) => capture_texture(gpu, tex, path),
+                            None => capture_surface(gpu, frame.as_ref().expect("surface frame"), path),
+                        };
+                        match res {
+                            Ok(()) => eprintln!("shot saved: {path}"),
+                            Err(e) => eprintln!("shot failed: {e:#}"),
+                        }
+                    }
+                    *exit_requested = true;
+                }
+                if let Some(f) = frame {
+                    f.present();
+                }
             }
             _ => {}
         }
@@ -1242,7 +1569,35 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| model_path.clone());
 
     let app_data = if model_path.to_ascii_lowercase().ends_with(".gsc") {
-        let map = rustt::map::parse(data).with_context(|| format!("parsing {}", model_path))?;
+        let mut map = rustt::map::parse(data).with_context(|| format!("parsing {}", model_path))?;
+        // Try to load the sibling .GIZ file for blowup positions.
+        if let Some(giz_path) = find_sibling_giz(&model_path) {
+            if let Ok(giz_data) = std::fs::read(&giz_path) {
+                if let Ok(giz) = rustt::giz::parse_giz(&giz_data) {
+                    let before = map.render_parts.len();
+                    // Mesh overrides: templates whose SO has cmd_count=0 but
+                    // whose mesh exists in room geometry. For "chair_01", the
+                    // mesh is at render_part index 1421 (mesh 982, 216 tris).
+                    let mut mesh_overrides = std::collections::HashMap::new();
+                    // chair_01 SO has cmd_count=0 (no game-model), but its
+                    // mesh is in room geometry.  Find it by mesh index.
+                    // TODO: generalize this for all levels.
+                    if let Some(rp) = map.render_parts.iter().position(|p| p.mesh == 982) {
+                        mesh_overrides.insert("chair_01".to_string(), rp);
+                    }
+                    map.apply_giz_blowups(&giz, &mesh_overrides);
+                    let after = map.render_parts.len();
+                    if after != before {
+                        println!("GIZ: applied {} blowup positions (+{} parts)", giz.blowups.len(), after - before);
+                    }
+                    map.apply_giz_buildits(&giz);
+                    // NOTE: GIZ obstacle positions are NOT applied to render_parts.
+                    // They are AI2 trigger/activation positions (where the player
+                    // stands to interact), not rendering positions.  Door SOs
+                    // already have correct transforms from GSC game-model commands.
+                }
+            }
+        }
         println!(
             "{}: {} render parts, {} meshes, {} materials, {} textures",
             file_name,
@@ -1251,7 +1606,12 @@ fn main() -> Result<()> {
             map.materials.len(),
             map.textures.len()
         );
-        AppData::Map(AppMap { file_name, map })
+        let lights = load_rtl_sibling(&model_path);
+        AppData::Map(AppMap {
+            file_name,
+            map,
+            lights,
+        })
     } else {
         let parsed = rustt::ghg::parse(data).with_context(|| format!("parsing {}", model_path))?;
         println!(
@@ -1354,9 +1714,112 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// World→screen projection matching the 3D camera's view-projection (Y-down
+/// screen space, imgui convention). None when the point is behind the camera.
+fn project_point(vp: glam::Mat4, p: glam::Vec3, w: f32, h: f32) -> Option<(f32, f32)> {
+    let clip = vp * p.extend(1.0);
+    if clip.w <= 1e-5 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    if ndc.z >= 1.0 || ndc.z <= -1.0 {
+        return None;
+    }
+    Some(((ndc.x * 0.5 + 0.5) * w, (ndc.y * -0.5 + 0.5) * h))
+}
+
+fn c32(r: u8, g: u8, b: u8) -> imgui::ImColor32 {
+    imgui::ImColor32::from_rgb_f32s(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+}
+
+/// Coordinate overlay for the grid: 2 m cross marks and 4 m labels projected
+/// onto the floor around the camera, a marker at the camera's own position,
+/// and a camera/bounds HUD. Only drawn when the grid is enabled.
+fn draw_coord_overlay(ui: &imgui::Ui, camera: &camera::OrbitCamera, gpu: &GpuRenderer) {
+    let io = ui.io();
+    let (w, h) = (io.display_size[0], io.display_size[1]);
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let vp = camera.view_proj(w / h.max(1.0));
+    let cam = camera.position();
+    let dl = ui.get_foreground_draw_list();
+
+    let yellow = c32(255, 220, 95);
+    let amber = c32(255, 185, 55);
+    let gray = c32(185, 185, 130);
+    let red = c32(255, 85, 85);
+    let cyan = c32(120, 235, 255);
+    let black = c32(0, 0, 0);
+
+    // Label window scales with camera distance: every 2 m cross marks, 4 m
+    // labels close up, 10 m labels across the wide view.
+    let half = (camera.distance * 0.8).clamp(20.0, 80.0);
+    let step = 2.0f32;
+    let mut i = ((cam.x - half) / step).ceil() * step;
+    while i <= cam.x + half {
+        let mut j = ((cam.z - half) / step).ceil() * step;
+        while j <= cam.z + half {
+            let p = glam::Vec3::new(i, 0.0, j);
+            if let Some((sx, sy)) = project_point(vp, p, w, h) {
+                let d2 = (i - cam.x) * (i - cam.x) + (j - cam.z) * (j - cam.z);
+                let near = d2 <= 24.0 * 24.0;
+                let on = (i.rem_euclid(10.0) == 0.0 && j.rem_euclid(10.0) == 0.0)
+                    || (near && i.rem_euclid(4.0) == 0.0 && j.rem_euclid(4.0) == 0.0);
+                if on {
+                    let text = format!("{},{}", i as i32, j as i32);
+                    let col = if i == 0.0 || j == 0.0 { amber } else { yellow };
+                    dl.add_text([sx + 1.5, sy - 13.5], black, text.clone());
+                    dl.add_text([sx + 1.0, sy - 14.0], col, text);
+                } else {
+                    dl.add_circle([sx, sy], 2.0, gray).build();
+                }
+            }
+            j += step;
+        }
+        i += step;
+    }
+
+    if let Some((sx, sy)) = project_point(vp, glam::Vec3::new(cam.x, 0.0, cam.z), w, h) {
+        dl.add_circle([sx, sy], 5.0, red).build();
+        dl.add_circle([sx, sy], 9.0, red).build();
+        let text = format!("cam {},{}", cam.x.round() as i32, cam.z.round() as i32);
+        dl.add_text([sx + 12.0, sy + 6.0], black, text.clone());
+        dl.add_text([sx + 11.0, sy + 5.0], red, text);
+    }
+
+    let b = &gpu.scene.bounds;
+    let text = format!(
+        "cam ({:.2}, {:.2}, {:.2})   bounds c=({:.1}, {:.1}, {:.1}) r={:.1}",
+        cam.x,
+        cam.y,
+        cam.z,
+        b.center.x,
+        b.center.y,
+        b.center.z,
+        b.radius,
+    );
+    dl.add_text([11.0, 11.0], black, text.clone());
+    dl.add_text([10.0, 10.0], cyan, text);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shaders_wgsl_validates_under_naga() {
+        let src = include_str!("shaders.wgsl");
+        let module = naga::front::wgsl::parse_str(src)
+            .expect("shaders.wgsl should parse as WGSL");
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator
+            .validate(&module)
+            .expect("shaders.wgsl should pass naga validation");
+    }
 
     #[test]
     fn layer_sets_found_for_pc_model() {

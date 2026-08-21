@@ -56,6 +56,10 @@ pub struct An3 {
     /// `data_frames - 1`, which equals frame 0. Subframes at/after this point
     /// are padding/hold and are not sampled.
     pub data_frames: usize,
+    /// Playback time offset (header 0x0E): subtracted from the playhead before
+    /// the data remap. Zero for all shipped clips; the game's evaluator applies
+    /// it as `(0x06 - 1) * (time - 0x0E) / (0x0A - 1)`.
+    pub time_offset: u16,
     pub num_moving: usize,
     pub keyblock_len: usize,
     /// 4INA: true -> apply the 0x20 identity-rotation logic.
@@ -101,6 +105,7 @@ impl An3 {
         let keyblock_len = u16(0x08) as usize;
         let num_frames = u16(0x0a).max(1) as usize;
         let data_frames = u16(0x06).max(1) as usize;
+        let time_offset = u16(0x0e);
 
         let base_add = f32(0x1c);
         let base_mul = f32(0x20);
@@ -189,6 +194,7 @@ impl An3 {
             num_bones,
             num_frames: num_frames.max(0),
             data_frames,
+            time_offset,
             num_moving,
             keyblock_len,
             four_ina,
@@ -242,20 +248,21 @@ impl An3 {
     /// Map a playback-frame `playhead` on the animation timeline
     /// `[0, num_frames)` to the stored data subframe range `[0, data_frames)`.
     ///
-    /// The game plays each animation over the longer 0x0A timeline, linearly
-    /// stretching the 0x06-frame data so the loop-closing data frame
-    /// (`data_frames - 1`, which holds frame 0's pose) lands exactly on the
-    /// last timeline frame (`num_frames - 1`). This makes the loop seamless and
-    /// never samples the padding/hold subframes past the real data. When
-    /// 0x0A == 0x06 this is the identity.
+    /// Matches the game's evaluator (`NuAnimBuffEvaluate`, e.g. `FUN_005cdd50`):
+    /// `data_playhead = (0x06 - 1) * (playhead - 0x0E) / (0x0A - 1)`, clamped to
+    /// `[0, 0x06 - 1]`. The game plays each animation over the longer 0x0A
+    /// timeline, linearly stretching the 0x06-frame data so the loop-closing
+    /// data frame (`data_frames - 1`, which holds frame 0's pose) lands exactly
+    /// on the last timeline frame (`num_frames - 1`). This makes the loop
+    /// seamless. When 0x0A == 0x06 this is the identity.
     pub fn remap_playhead(&self, playhead: f32) -> f32 {
         let dst = self.num_frames.max(1) as f32;
         let src = self.data_frames.max(1) as f32;
         if dst <= 1.0 || src <= 1.0 {
             return 0.0;
         }
-        let p = playhead.clamp(0.0, dst - 1.0);
-        (p * (src - 1.0) / (dst - 1.0)).clamp(0.0, src - 1.0)
+        let t = playhead - self.time_offset as f32;
+        (t * (src - 1.0) / (dst - 1.0)).clamp(0.0, src - 1.0)
     }
 
     /// Evaluated channel value at fractional data-subframe `frame` (range
@@ -295,31 +302,53 @@ impl An3 {
         }
     }
 
+    /// Sample the animated channel at fractional data-subframe `frame` (range
+    /// `[0, data_frames)`; use `remap_playhead` to convert a timeline/playback
+    /// frame first).
+    ///
+    /// Reproduces the game's evaluator (`NuAnimBuffEvaluate`, e.g.
+    /// `FUN_005cdd50`): the playhead is floored to the sample index and the
+    /// value is linearly interpolated toward the next sample by the fractional
+    /// remainder (`value = sample[i] + frac * (sample[i+1] - sample[i])`). The
+    /// evaluator's index helper truncates toward zero on SSE2 CPUs and rounds
+    /// on legacy x87; playheads here are non-negative, so truncation == floor.
+    /// Each sample belongs to its own block pair, so a subframe-3 sample
+    /// interpolates across the pair boundary into subframe 0 of the next pair
+    /// (the tail block of the file provides that next pair).
     fn sample_channel(&self, idx: usize, frame: f32) -> f32 {
         let (scale, offset) = self.movpar[idx];
         let n = self.blocks.len();
         if n < 2 {
             return offset;
         }
-        // Each adjacent (A,B) block pair produces 4 subframes, so the total
-        // number of decodable subframes is (n-1)*4. The animation's real data
-        // spans `data_frames` subframes (header 0x06); subframes at/after that
-        // are padding/hold and must not be sampled (in original game files they
-        // can interpolate toward a zero-padded tail block, producing garbage).
+        // The animation's real data spans `data_frames` subframes (header
+        // 0x06); subframes at/after that are padding and must not be sampled
+        // (in original game files they can interpolate toward a zero-padded
+        // tail block, producing garbage).
         let decoded_max = (n as f32 - 1.0) * 4.0 - 1.0;
         let data_max = (self.data_frames as f32 - 1.0).min(decoded_max).max(0.0);
         let f = frame.clamp(0.0, data_max);
-        let pair = (f / 4.0).floor() as usize;
-        let pair = pair.min(n - 2);
-        let sub = (f - pair as f32 * 4.0) as usize & 3;
-        let a = &self.blocks[pair];
-        let b = &self.blocks[pair + 1];
-        let raw = if self.channel_types[idx] == 0x07 {
-            Self::decode_block_07(&a[idx], &b[idx])
-        } else {
-            Self::decode_block(&a[idx], &b[idx])
+
+        let sample = |k: f32| -> f32 {
+            let k = k.clamp(0.0, decoded_max);
+            let pair = (k / 4.0).floor() as usize;
+            let pair = pair.min(n - 2);
+            let sub = (k as i64).rem_euclid(4) as usize;
+            let a = &self.blocks[pair];
+            let b = &self.blocks[pair + 1];
+            let raw = if self.channel_types[idx] == 0x07 {
+                Self::decode_block_07(&a[idx], &b[idx])
+            } else {
+                Self::decode_block(&a[idx], &b[idx])
+            };
+            raw[sub]
         };
-        raw[sub] * scale + offset
+
+        let i = f.floor();
+        let frac = f - i;
+        let v0 = sample(i);
+        let v1 = sample(i + 1.0);
+        (v0 + frac * (v1 - v0)) * scale + offset
     }
 
     /// Effective parent-relative rotation for `bone` at `frame`. For 4INA bones
@@ -467,4 +496,50 @@ impl An3 {
     pub fn scale_flag(&self, bone: usize) -> bool {
         self.footer.get(bone).map_or(false, |f| f & 0x08 != 0)
     }
+}
+
+/// World matrices for a crossfade between `a` at `frame_a` and `b` at
+/// `frame_b`, with `t` in `[0,1]` (`0` = clip `a`, `1` = clip `b`).
+///
+/// Mirrors the game's two-buffer blend (`NuAnimBuffBlendTwo`,
+/// `FUN_005ebb90`): both clips are evaluated and their per-bone local
+/// transforms are blended before the parent chain is walked. Translations
+/// and scales are lerped, rotations are slerped (shortest path). Both
+/// clips must share the same bone count and hierarchy as `parents`.
+pub fn blended_bone_worlds(
+    a: &An3,
+    b: &An3,
+    parents: &[i32],
+    rest_locals: &[Mat4],
+    frame_a: f32,
+    frame_b: f32,
+    t: f32,
+) -> Result<Vec<Mat4>> {
+    if a.num_bones != b.num_bones || parents.len() != a.num_bones {
+        bail!(
+            "bone count mismatch for blend ({} vs {}, {} parents)",
+            a.num_bones,
+            b.num_bones,
+            parents.len()
+        );
+    }
+    let mut worlds = Vec::with_capacity(a.num_bones);
+    for bone in 0..a.num_bones {
+        let la = a.bone_local(bone, frame_a, rest_locals.get(bone));
+        let lb = b.bone_local(bone, frame_b, rest_locals.get(bone));
+        let (sa, ra, ta) = la.to_scale_rotation_translation();
+        let (sb, rb, tb) = lb.to_scale_rotation_translation();
+        let local = Mat4::from_scale_rotation_translation(
+            sa.lerp(sb, t),
+            ra.slerp(rb, t),
+            ta.lerp(tb, t),
+        );
+        let w = if parents[bone] < 0 {
+            local
+        } else {
+            worlds[parents[bone] as usize] * local
+        };
+        worlds.push(w);
+    }
+    Ok(worlds)
 }

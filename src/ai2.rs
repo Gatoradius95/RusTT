@@ -80,7 +80,7 @@ fn angle(u: u16) -> f32 {
 }
 
 /// Read `n` bytes as a name string, truncated at the first NUL and trimmed.
-fn read_name(data: &[u8], o: usize, n: usize) -> String {
+pub(crate) fn read_name(data: &[u8], o: usize, n: usize) -> String {
     let end = data[o..o + n]
         .iter()
         .position(|&b| b == 0)
@@ -91,50 +91,50 @@ fn read_name(data: &[u8], o: usize, n: usize) -> String {
         .to_string()
 }
 
-struct R<'a> {
+pub(crate) struct R<'a> {
     d: &'a [u8],
     p: usize,
 }
 
 impl<'a> R<'a> {
-    fn new(d: &'a [u8]) -> Self {
+    pub(crate) fn new(d: &'a [u8]) -> Self {
         Self { d, p: 0 }
     }
 
-    fn pos(&self) -> usize {
+    pub(crate) fn pos(&self) -> usize {
         self.p
     }
 
-    fn skip(&mut self, n: usize) -> Result<()> {
+    pub(crate) fn skip(&mut self, n: usize) -> Result<()> {
         ensure!(self.p + n <= self.d.len(), "read past end at {:#x}", self.p);
         self.p += n;
         Ok(())
     }
 
-    fn bytes(&mut self, n: usize) -> Result<&'a [u8]> {
+    pub(crate) fn bytes(&mut self, n: usize) -> Result<&'a [u8]> {
         ensure!(self.p + n <= self.d.len(), "read past end at {:#x}", self.p);
         let s = &self.d[self.p..self.p + n];
         self.p += n;
         Ok(s)
     }
 
-    fn u8(&mut self) -> Result<u8> {
+    pub(crate) fn u8(&mut self) -> Result<u8> {
         Ok(self.bytes(1)?[0])
     }
 
-    fn u16(&mut self) -> Result<u16> {
+    pub(crate) fn u16(&mut self) -> Result<u16> {
         Ok(u16::from_le_bytes(self.bytes(2)?.try_into().unwrap()))
     }
 
-    fn u32(&mut self) -> Result<u32> {
+    pub(crate) fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
     }
 
-    fn f32(&mut self) -> Result<f32> {
+    pub(crate) fn f32(&mut self) -> Result<f32> {
         Ok(f32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
     }
 
-    fn vec3(&mut self) -> Result<Vec3> {
+    pub(crate) fn vec3(&mut self) -> Result<Vec3> {
         Ok(Vec3::new(self.f32()?, self.f32()?, self.f32()?))
     }
 

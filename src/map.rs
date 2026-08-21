@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{ensure, Result};
 
-use crate::ghg::TextureFmt;
+use crate::ghg::{lighting_stage_from_defines, TextureFmt};
 
 /// A parsed LEGO TCS level `.GSC` bundle (the big scene file that holds the
 /// whole map: textures, shared vertex/index buffers, materials and the
@@ -50,6 +50,12 @@ pub struct Map<'a> {
     /// in game-model order. The mesh list itself carries no material, so this
     /// is the mapping a renderer needs. Empty when the file has no DISP block.
     pub render_parts: Vec<RenderPart>,
+    /// LIGHTMAP display-command resources (command type 0xb0), keyed by their
+    /// file address. Each is the lightmap state an MTL/GEOMCALL consumes:
+    /// 4 texture real-indices plus the float4 offset/scale (`lightmapOffset`
+    /// in the shipped shader: `lightmapCoord = uv * offset.zw + offset.xy`).
+    /// `RenderPart::lightmap` indexes this map.
+    pub lightmaps: HashMap<u32, LightmapState>,
     /// Raw scene-header bookkeeping.
     pub scene: SceneInfo,
 }
@@ -60,6 +66,31 @@ pub struct RenderPart {
     pub mesh: usize,
     /// Index into `Map::materials`.
     pub material: usize,
+    /// Address of the LIGHTMAP display command this part draws under
+    /// (tracked so a renderer can bind the per-draw lightmap state).
+    /// `RenderPart::lightmap` indexes this map.
+    pub lightmap: u32,
+    /// 4×4 model matrix from the most recent MTXLOAD display command that
+    /// precedes this part's GEOMCALL in the display command list. Meshes in
+    /// the GSC store vertices in **local space**; the engine applies this
+    /// transform to place them in world space. Identity for static geometry.
+    pub transform: [[f32; 4]; 4],
+    /// SO name from NTBL (SpecialObjects only, `None` for room geometry).
+    pub name: Option<String>,
+}
+
+/// The LIGHTMAP display-command resource payload (BrickBench
+/// `LightmapCommandResource`, DisplaySetBlock: `int type; int lm, lm2, lm3,
+/// lm4; float x, y, z, w`).
+#[derive(Clone, Debug)]
+pub struct LightmapState {
+    /// 1/3 = single-texture, 2/4 = four-texture (3/4 carry a full offset
+    /// vector in zw; 1/2 use only x/y).
+    pub ty: u32,
+    /// Texture real-indices (the pages); -1 entries carry no texture.
+    pub tex: [i32; 4],
+    /// lightmapOffset: x/y = offset, z/w = scale.
+    pub off: [f32; 4],
 }
 
 impl Map<'_> {
@@ -71,6 +102,75 @@ impl Map<'_> {
         self.texture_real_index
             .iter()
             .position(|&r| r as i16 == real_index)
+    }
+
+    /// Overlay GIZ blowup positions onto render_parts.
+    ///
+    /// For each GIZ blowup instance whose template matches an SO render_part
+    /// name, the existing render_part's transform is replaced with the GIZ
+    /// world-space position (translation only). Additional instances beyond the
+    /// first for each template are appended as new render_parts.
+    ///
+    /// `mesh_overrides` maps template names (e.g. "chair_01") to render_part
+    /// indices for SOs that have `cmd_count=0` (no game-model commands) but
+    /// whose mesh exists in the room geometry.
+    pub fn apply_giz_blowups(
+        &mut self,
+        giz: &crate::giz::Giz,
+        mesh_overrides: &std::collections::HashMap<String, usize>,
+    ) {
+        let so_names: std::collections::HashSet<&str> = self
+            .render_parts
+            .iter()
+            .filter_map(|p| p.name.as_deref())
+            .collect();
+        let matches = crate::giz::match_blowups_to_sos(&giz.blowups, &so_names, mesh_overrides);
+        crate::giz::apply_blowup_positions(&mut self.render_parts, &matches, mesh_overrides);
+    }
+
+    /// Overlay GIZ buildit positions onto render_parts.
+    ///
+    /// Each GIZ buildit's sub-objects directly match SO entity names.
+    /// For each match, the render_part's transform is replaced with
+    /// the buildit's world-space position.
+    pub fn apply_giz_buildits(&mut self, giz: &crate::giz::Giz) {
+        let so_names: std::collections::HashSet<&str> = self
+            .render_parts
+            .iter()
+            .filter_map(|p| p.name.as_deref())
+            .collect();
+        let matches = crate::giz::match_buildits_to_sos(&giz.buildits, &so_names);
+        let count = matches.len();
+        // Sub-objects keep their GSC-baked world positions (apply_transform
+        // already baked the render_part transform into vertices).  We do NOT
+        // override them with the buildit center — the engine only uses the
+        // center for proximity detection and AABB computation.
+        eprintln!("GIZ buildits: matched {count} sub-objects");
+    }
+
+    /// Apply GIZ obstacle positions/rotations to render_parts via MAP.TXT.
+    ///
+    /// The matching chain is: GIZ obstacle name → MAP.TXT obstacle name →
+    /// obj entries → SO render_part names.  For each match, the render_part's
+    /// transform is replaced with the GIZ obstacle's position/rotation/scale.
+    pub fn apply_giz_obstacles(
+        &mut self,
+        giz: &crate::giz::Giz,
+        map_txt: &crate::map_txt::MapTxt,
+    ) {
+        let so_names: std::collections::HashSet<&str> = self
+            .render_parts
+            .iter()
+            .filter_map(|p| p.name.as_deref())
+            .collect();
+        let matches = crate::giz::match_obstacles_to_sos(
+            &giz.obstacles,
+            &map_txt.obstacles,
+            &so_names,
+        );
+        let matched = matches.len();
+        crate::giz::apply_obstacle_positions(&mut self.render_parts, &matches);
+        eprintln!("GIZ obstacles: applied {matched} obstacle positions");
     }
 }
 
@@ -98,10 +198,80 @@ pub struct Material {
     pub diffuse: [f32; 4],
     /// Real index into the texture list (`diffuseFileTexture` in BrickBench).
     pub tex_id: i16,
+    /// Specular map texture index (record +0xFC, i32). -1 = none.
+    /// Always co-occurs with shader_defines bit 3 (phong specular).
+    pub tex_specular: i32,
+    /// Normal map texture index (record +0x100, i32). -1 = none.
+    /// Always co-occurs with shader_defines bit 0 (surface type normal).
+    pub tex_normal: i32,
+    /// Cubemap texture index (record +0x104, i32). -1 = none.
+    pub tex_cubemap: i32,
     /// 0xB4 in the material record (texture flags).
     pub texture_flags: u32,
     /// 0x1F0 (vertex format bits).
     pub vertex_format_bits: u32,
+    /// Lighting model derived from the MS00 record's `shaderDefines` bits
+    /// (record +0x26C): 0 = DISABLE, 1 = LAMBERT, 6 = PHONG. Map materials
+    /// are prelit (bit 0x1000 set), so they decode to DISABLE/LAMBERT and
+    /// their light comes from the baked lightmaps.
+    pub lighting_stage: u8,
+    /// Uber Shader 2.0 per-material params (record +0x12C/0x130/0x144/0x148):
+    /// x = kCosPower, y = kSpecular, z = kFresnel, w = kFresnelPower.
+    pub specular_params: [f32; 4],
+    /// Raw `shaderDefines` bits (record +0x26C).
+    pub shader_defines: u32,
+    /// Lightmap set index (record +0x15C, byte). Nonzero together with the
+    /// sign bit of `texture_flags` enables the lightmap stage (the game's
+    /// `LIGHTMAP_STAGE != DISABLE`; the exe reads this at runtime record
+    /// +0xA8 = file record +0x15C).
+    pub lightmap_set_index: u8,
+    /// UV set coords (record +0x270). Selects the lightmap UV set in TCS
+    /// (`(uvSetCoords >> 2) & 3`, falling back to `lightmap_set_index - 1`).
+    pub uv_set_coords: u32,
+    /// The record's alpha/depth word (record +0x40, BrickBench `alphaBlend`).
+    /// Low nibble = blend mode per `blend_mode()`, bits 14-15 = depth mode per
+    /// `depth_mode()`, bits 20-27/23-30 = alpha-cutoff format/value.
+    pub alpha_type: u32,
+}
+
+impl Material {
+    /// Lightmap stage as the game computes it: 0 = DISABLE,
+    /// 1 = LIGHTMAP_SMOOTH, 2 = LIGHTMAP_DIRECTIONAL.
+    pub fn lightmap_stage(&self) -> u8 {
+        if (self.texture_flags as i32) >= 0 || self.lightmap_set_index == 0 {
+            return 0;
+        }
+        if self.texture_flags & 0x800000 != 0 {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// The UV set the lightmap is sampled with (BrickBench's TCS rule).
+    pub fn lightmap_uvset(&self) -> u8 {
+        let c = ((self.uv_set_coords >> 2) & 3) as u8;
+        if c != 0 {
+            c
+        } else {
+            self.lightmap_set_index.saturating_sub(1)
+        }
+    }
+
+    /// Blended-draw mode from the alpha word's low nibble (BrickBench
+    /// `generateDepthAlpha`): 0 NONE, 1 TRANSPARENT (src-alpha,
+    /// one-minus-src-alpha), 2 TRANSPARENT_IGNORE_DEST (src-alpha, one),
+    /// 3 REVERSE_TRANSPARENT (zero, one-minus-src-alpha, subtract),
+    /// 10 NONE_FIXED_ALPHA.
+    pub fn blend_mode(&self) -> u8 {
+        (self.alpha_type & 0xf) as u8
+    }
+
+    /// Depth handling from bits 14-15: 0 NORMAL, 1 NO_WRITE, 2 ALWAYS_PASS,
+    /// 3 IGNORE_DEPTH.
+    pub fn depth_mode(&self) -> u8 {
+        ((self.alpha_type >> 14) & 3) as u8
+    }
 }
 
 /// A renderable mesh (triangle strip, `mesh_type == 6`).
@@ -148,9 +318,12 @@ fn check_range(d: &[u8], o: usize, n: usize) -> Result<()> {
 
 const BLOCK_MS00: u32 = 0x3030534d; // "MS00"
 const BLOCK_DISP: u32 = 0x50534944; // "DISP"
+const BLOCK_N_TBL: u32 = 0x4C42544E; // "NTBL"
 
 /// Display-command types from BrickBench's `DisplayCommand.CommandType`.
 const CMD_GEOMCALL: u8 = 0x82;
+const CMD_MTXLOAD: u8 = 0x83;
+const CMD_LIGHTMAP: u8 = 0xb0;
 const CMD_END: u8 = 0x8e;
 
 /// BrickBench `readPointer`: a self-relative signed offset from the field's
@@ -299,6 +472,7 @@ pub fn parse(data: &[u8]) -> Result<Map<'_>> {
             let mut q = pos + 16;
             for _ in 0..count {
                 let id = at_i32(data, q + 0x38);
+                let alpha_type = at_u32(data, q + 0x40);
                 let diffuse = [
                     f32::from_le_bytes(data[q + 0x54..q + 0x58].try_into().unwrap()),
                     f32::from_le_bytes(data[q + 0x58..q + 0x5c].try_into().unwrap()),
@@ -306,14 +480,34 @@ pub fn parse(data: &[u8]) -> Result<Map<'_>> {
                     f32::from_le_bytes(data[q + 0x60..q + 0x64].try_into().unwrap()),
                 ];
                 let tex_id = i16::from_le_bytes(data[q + 0x74..q + 0x76].try_into().unwrap());
+                let tex_specular = i32::from_le_bytes(data[q + 0xfc..q + 0x100].try_into().unwrap());
+                let tex_normal = i32::from_le_bytes(data[q + 0x100..q + 0x104].try_into().unwrap());
+                let tex_cubemap = i32::from_le_bytes(data[q + 0x104..q + 0x108].try_into().unwrap());
                 let texture_flags = at_u32(data, q + 0xb4);
                 let vertex_format_bits = at_u32(data, q + 0x1f0);
+                let spec_mult = f32::from_le_bytes(data[q + 0x12c..q + 0x130].try_into().unwrap());
+                let spec_exp = f32::from_le_bytes(data[q + 0x130..q + 0x134].try_into().unwrap());
+                let fres_mult = f32::from_le_bytes(data[q + 0x144..q + 0x148].try_into().unwrap());
+                let fres_coeff = f32::from_le_bytes(data[q + 0x148..q + 0x14c].try_into().unwrap());
+                let shader_defines = at_u32(data, q + 0x26c);
+                let lighting_stage = lighting_stage_from_defines(shader_defines);
+                let lightmap_set_index = data[q + 0x15c];
+                let uv_set_coords = at_u32(data, q + 0x270);
                 materials.push(Material {
                     id,
                     diffuse,
                     tex_id,
+                    tex_specular,
+                    tex_normal,
+                    tex_cubemap,
                     texture_flags,
                     vertex_format_bits,
+                    lighting_stage,
+                    specular_params: [spec_exp, spec_mult, fres_mult, fres_coeff],
+                    shader_defines,
+                    lightmap_set_index,
+                    uv_set_coords,
+                    alpha_type,
                 });
                 q += 0x2c4;
             }
@@ -348,11 +542,34 @@ pub fn parse(data: &[u8]) -> Result<Map<'_>> {
     // The GSNH mesh list carries no material; the DISP block's game models
     // pair each drawable with a material index (MS00 order) and a display
     // command whose GEOMCALL points back at a mesh address.
-    let render_parts = if let Some(disp) = find_block_content(data, nu20 + 0x20, BLOCK_DISP)? {
-        parse_render_parts(data, disp, &meshes)?
-    } else {
-        Vec::new()
-    };
+
+    // Parse NTBL block to build a name-address→string lookup for SO names.
+    let mut ntbl_names: HashMap<usize, String> = HashMap::new();
+    if let Some(ntbl_content) = find_block_content(data, nu20 + 0x20, BLOCK_N_TBL)? {
+        // NTBL content starts with a u32 size, then null-terminated strings.
+        let ntbl_start = ntbl_content + 4;
+        let ntbl_end = ntbl_start + at_u32(data, ntbl_content) as usize;
+        let end = ntbl_end.min(data.len());
+        let mut p = ntbl_start;
+        while p < end {
+            let start = p;
+            while p < end && data[p] != 0 {
+                p += 1;
+            }
+            let name = String::from_utf8_lossy(&data[start..p]).to_string();
+            ntbl_names.insert(start, name);
+            if p < end {
+                p += 1;
+            }
+        }
+    }
+
+    let (render_parts, lightmaps) =
+        if let Some(disp) = find_block_content(data, nu20 + 0x20, BLOCK_DISP)? {
+            parse_render_parts(data, disp, &meshes, &ntbl_names)?
+        } else {
+            (Vec::new(), HashMap::new())
+        };
 
     Ok(Map {
         textures,
@@ -362,6 +579,7 @@ pub fn parse(data: &[u8]) -> Result<Map<'_>> {
         materials,
         meshes,
         render_parts,
+        lightmaps,
         scene: SceneInfo {
             gsnh_data,
             tex_count,
@@ -388,7 +606,12 @@ fn find_block_content(data: &[u8], start: usize, id: u32) -> Result<Option<usize
 }
 
 /// Resolve the DISP game-model records into flat (mesh, material) parts.
-fn parse_render_parts(data: &[u8], disp: usize, meshes: &[Mesh]) -> Result<Vec<RenderPart>> {
+fn parse_render_parts(
+    data: &[u8],
+    disp: usize,
+    meshes: &[Mesh],
+    ntbl_names: &HashMap<usize, String>,
+) -> Result<(Vec<RenderPart>, HashMap<u32, LightmapState>)> {
     // Display command list: 16-byte commands [u8 type][u8 flags][2 pad][rel ptr],
     // terminated by an END command.
     let cmd_start = rel(data, disp + 8);
@@ -411,8 +634,64 @@ fn parse_render_parts(data: &[u8], disp: usize, meshes: &[Mesh]) -> Result<Vec<R
         mesh_by_addr.insert(m.address as u32, i);
     }
 
+    // Walk the command list once to build two per-index lookups:
+    //  1. LIGHTMAP state (already tracked for the lightmap HashMap).
+    //  2. The current 4×4 MTXLOAD transform at each command index.
+    let mut lightmaps: HashMap<u32, LightmapState> = HashMap::new();
+    let identity = [[1f32; 4]; 4];
+    let mut cur_xform = identity;
+    // Parallel to `commands`: the transform active at each command index.
+    let mut cmd_xform: Vec<[[f32; 4]; 4]> = Vec::with_capacity(commands.len());
+    for &(ty, resource) in &commands {
+        match ty {
+            CMD_MTXLOAD => {
+                let a = resource as usize;
+                if a + 64 <= data.len() {
+                    // File is column-major: element at row r, col c is at
+                    // offset (c*4+r)*4.  m(r,c) reads (r*4+c)*4 = M[c][r],
+                    // so we transpose when assigning to get M[r][c].
+                    let m = |r: usize, c: usize| -> f32 {
+                        f32::from_le_bytes(data[a + (r * 4 + c) * 4..a + (r * 4 + c) * 4 + 4].try_into().unwrap())
+                    };
+                    cur_xform = [
+                        [m(0, 0), m(1, 0), m(2, 0), m(3, 0)],
+                        [m(0, 1), m(1, 1), m(2, 1), m(3, 1)],
+                        [m(0, 2), m(1, 2), m(2, 2), m(3, 2)],
+                        [m(0, 3), m(1, 3), m(2, 3), m(3, 3)],
+                    ];
+                }
+            }
+            CMD_LIGHTMAP => {
+                if !lightmaps.contains_key(&resource) {
+                    let a = resource as usize;
+                    if a + 36 <= data.len() {
+                        let f32at = |o: usize| {
+                            f32::from_le_bytes(data[a + o..a + o + 4].try_into().unwrap())
+                        };
+                        lightmaps.insert(
+                            resource,
+                            LightmapState {
+                                ty: at_u32(data, a),
+                                tex: [
+                                    at_u32(data, a + 4) as i32,
+                                    at_u32(data, a + 8) as i32,
+                                    at_u32(data, a + 12) as i32,
+                                    at_u32(data, a + 16) as i32,
+                                ],
+                                off: [f32at(20), f32at(24), f32at(28), f32at(32)],
+                            },
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+        cmd_xform.push(cur_xform);
+    }
+
     // Game models: each is a 0x0C record pairing a material index list with a
     // display-command index list.
+    let cmd_at = |ix: usize| commands.get(ix).copied();
     let model_count = at_u32(data, disp + 0x10) as usize;
     let models = rel(data, disp + 0x14);
     let mut parts = Vec::new();
@@ -433,7 +712,7 @@ fn parse_render_parts(data: &[u8], disp: usize, meshes: &[Mesh]) -> Result<Vec<R
         for k in 0..cmd_count {
             let material = at_u32(data, mat_off + k * 4) as usize;
             let cmd_idx = at_u32(data, mesh_off + k * 4) as usize;
-            let Some(&(ty, addr)) = commands.get(cmd_idx) else {
+            let Some((ty, addr)) = cmd_at(cmd_idx) else {
                 continue;
             };
             if ty != CMD_GEOMCALL {
@@ -442,10 +721,127 @@ fn parse_render_parts(data: &[u8], disp: usize, meshes: &[Mesh]) -> Result<Vec<R
             let Some(&mesh) = mesh_by_addr.get(&addr) else {
                 continue;
             };
-            parts.push(RenderPart { mesh, material });
+            let transform = cmd_xform.get(cmd_idx).copied().unwrap_or(identity);
+            // Find the nearest LIGHTMAP at or before this command index.
+            let mut lm_addr = 0u32;
+            for j in (0..=cmd_idx).rev() {
+                if let Some((t2, a2)) = cmd_at(j) {
+                    if t2 == CMD_LIGHTMAP {
+                        lm_addr = a2;
+                        break;
+                    }
+                }
+            }
+            parts.push(RenderPart {
+                mesh,
+                material,
+                lightmap: lm_addr,
+                transform,
+                name: None,
+            });
         }
     }
-    Ok(parts)
+    // --- SpecialObjects (DISP+0x6C/0x70) ------------------------------------
+    // Each SpecialObject is a 0xD0-byte record:
+    //   +0x40..+0x7F  4×4 column-major transform matrix (rows stored as
+    //                  row0=[col0,col1,col2,col3], same layout as MTXLOAD).
+    //   +0xB0          self-relative pointer to a game-model entry (0xC bytes:
+    //                  [cmd_count, mat_off, mesh_off]) in the same array the
+    //                  regular game-model loop uses.
+    //   +0xB4          self-relative pointer to the NTBL name string.
+    let spec_count = at_u32(data, disp + 0x6c) as usize;
+    let spec_base = rel(data, disp + 0x70);
+    let model_count = at_u32(data, disp + 0x10) as usize;
+    let models_base = rel(data, disp + 0x14);
+    for i in 0..spec_count {
+        let a = spec_base + i * 0xd0;
+        if a + 0xd0 > data.len() {
+            break;
+        }
+        // Read the 4×4 transform.  The file stores matrices column-major but
+        // our m(r,c) helper reads them as if row-major, effectively producing
+        // M_file^T.  apply_transform expects translation in [0..2][3] (column
+        // 3), so we transpose once more to go from M_file^T back to M_file.
+        let xf = |r: usize, c: usize| -> f32 {
+            f32::from_le_bytes(
+                data[a + 0x40 + (r * 4 + c) * 4..a + 0x40 + (r * 4 + c) * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        let so_xform = [
+            [xf(0, 0), xf(1, 0), xf(2, 0), xf(3, 0)],
+            [xf(0, 1), xf(1, 1), xf(2, 1), xf(3, 1)],
+            [xf(0, 2), xf(1, 2), xf(2, 2), xf(3, 2)],
+            [xf(0, 3), xf(1, 3), xf(2, 3), xf(3, 3)],
+        ];
+
+        // Resolve game-model pointer.
+        let gm_ptr = rel(data, a + 0xb0);
+        // Resolve NTBL name string pointer.
+        let so_name = {
+            let name_ptr = rel(data, a + 0xb4);
+            if name_ptr != 0 {
+                ntbl_names.get(&name_ptr).cloned()
+            } else {
+                None
+            }
+        };
+        // Validate it falls inside the game-model array.
+        if gm_ptr < models_base
+            || gm_ptr + 0xc > models_base + model_count * 0xc
+            || (gm_ptr - models_base) % 0xc != 0
+        {
+            continue;
+        }
+        let cmd_count = at_u32(data, gm_ptr) as usize;
+        if cmd_count == 0 {
+            continue;
+        }
+        let mat_off = rel(data, gm_ptr + 4);
+        let mesh_off = rel(data, gm_ptr + 8);
+        if mat_off == 0 || mesh_off == 0 {
+            continue;
+        }
+        if mat_off + cmd_count * 4 > data.len() || mesh_off + cmd_count * 4 > data.len() {
+            continue;
+        }
+        for k in 0..cmd_count {
+            let material = at_u32(data, mat_off + k * 4) as usize;
+            let cmd_idx = at_u32(data, mesh_off + k * 4) as usize;
+            let Some((ty, addr)) = cmd_at(cmd_idx) else {
+                continue;
+            };
+            if ty != CMD_GEOMCALL {
+                continue;
+            }
+            let Some(&mesh) = mesh_by_addr.get(&addr) else {
+                continue;
+            };
+            // Use the SO's matrix directly as the world transform.  The SO's
+            // matrix at +0x40 is the entity's world-space position/rotation.
+            // The command-list MTXLOAD values may be stale (from other models)
+            // or intended to be overridden by the engine for SO instances.
+            let mut lm_addr = 0u32;
+            for j in (0..=cmd_idx).rev() {
+                if let Some((t2, a2)) = cmd_at(j) {
+                    if t2 == CMD_LIGHTMAP {
+                        lm_addr = a2;
+                        break;
+                    }
+                }
+            }
+            parts.push(RenderPart {
+                mesh,
+                material,
+                lightmap: lm_addr,
+                transform: so_xform,
+                name: so_name.clone(),
+            });
+        }
+    }
+
+    Ok((parts, lightmaps))
 }
 
 /// Walk the block stream. `pos` starts at the first block (right after the

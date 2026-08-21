@@ -60,7 +60,9 @@ impl OrbitCamera {
     }
 
     fn right(&self) -> Vec3 {
-        self.forward_h().cross(UP).normalize()
+        // Left-handed view (glam `lh`): screen-right = `up × forward`, the
+        // opposite of the right-handed `forward × up`.
+        UP.cross(self.forward_h()).normalize()
     }
 
     /// Orbit around the target with a cursor delta in pixels.

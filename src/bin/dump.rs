@@ -192,6 +192,18 @@ fn main() -> Result<()> {
         }
         println!("  bbox x:[{:.4},{:.4}] y:[{:.4},{:.4}] z:[{:.4},{:.4}]",
             mn[0], mx[0], mn[1], mx[1], mn[2], mx[2]);
+        if md.pos.len() <= 128 && args.iter().any(|x| x == "--tris") {
+            for (ti, c) in md.idx.chunks(3).enumerate() {
+                let (a, b, d) = (c[0] as usize, c[1] as usize, c[2] as usize);
+                println!("  t{ti}: ({a},{b},{d}) p=({:.4},{:.4},{:.4}) ({:.4},{:.4},{:.4}) ({:.4},{:.4},{:.4}) uv=({:.3},{:.3}) ({:.3},{:.3}) ({:.3},{:.3})",
+                    md.pos[a][0], md.pos[a][1], md.pos[a][2],
+                    md.pos[b][0], md.pos[b][1], md.pos[b][2],
+                    md.pos[d][0], md.pos[d][1], md.pos[d][2],
+                    md.uv[a][0], md.uv[a][1],
+                    md.uv[b][0], md.uv[b][1],
+                    md.uv[d][0], md.uv[d][1]);
+            }
+        }
         return Ok(());
     }
 
@@ -290,6 +302,65 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // --shd <part> <slot> [ymin ymax]: print per-vertex base pos + delta for a
+    // part's shape slot, optionally filtered to a y range (to compare how the
+    // mouth quads vs the teeth strip move under the same BSA channel).
+    if let Some(a) = args.iter().position(|x| x == "--shd") {
+        let num = |k: usize| args.get(a + k + 1).and_then(|s| s.parse::<f32>().ok());
+        let part = num(0).unwrap_or(0.0) as usize;
+        let slot = num(1).unwrap_or(0.0) as usize;
+        let (ymin, ymax) = (num(2).unwrap_or(f32::NEG_INFINITY), num(3).unwrap_or(f32::INFINITY));
+        let p = parsed.parts.get(part).context("part out of range")?;
+        let md = rustt::glb::build_mesh(&parsed, part);
+        let Some(d) = p.dynamic_buffers.get(slot) else {
+            anyhow::bail!("slot {slot} out of range for part {part}");
+        };
+        println!(
+            "part {part} slot {slot}: {} verts, {} deltas (y filter {ymin:.3}..{ymax:.3})",
+            md.pos.len(),
+            d.as_ref().map_or(0, |v| v.len())
+        );
+        let Some(d) = d else {
+            return Ok(());
+        };
+        for (i, (base, dv)) in md.pos.iter().zip(d.iter()).enumerate() {
+            if base[1] < ymin || base[1] > ymax {
+                continue;
+            }
+            println!(
+                "v{i:3} base=({:+.4},{:+.4},{:+.4}) d=({:+.4},{:+.4},{:+.4})",
+                base[0], base[1], base[2], dv[0], dv[1], dv[2]
+            );
+        }
+        return Ok(());
+    }
+
+    // --px <tex> <x> <y> <w> <h>: print an RGBA grid of the region (for
+    // inspecting face/mouth texels during debugging).
+    if let Some(a) = args.iter().position(|x| x == "--px") {
+        let num = |k: usize| args.get(a + k + 1).and_then(|s| s.parse::<usize>().ok());
+        let idx = num(0).unwrap_or(0);
+        let x0 = num(1).unwrap_or(0);
+        let y0 = num(2).unwrap_or(0);
+        let w = num(3).unwrap_or(16);
+        let h = num(4).unwrap_or(16);
+        let t = parsed.textures.get(idx).context("texture index out of range")?;
+        let rgba = rustt::dxt::decode(t)?;
+        let step = num(5).unwrap_or(1).max(1);
+        for y in (y0..y0 + h).step_by(step) {
+            let mut line = String::new();
+            for x in (x0..x0 + w).step_by(step) {
+                let o = (y * t.w + x) * 4;
+                line.push_str(&format!(
+                    "({:02x}{:02x}{:02x}a{:02x}) ",
+                    rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3]
+                ));
+            }
+            println!("y={y:03} {line}");
+        }
+        return Ok(());
+    }
+
     if let Some(dir) = args.iter().position(|a| a == "--texpng") {
         let outdir = args.get(dir + 1).expect("--texpng needs a dir");
         std::fs::create_dir_all(outdir)?;
@@ -336,6 +407,50 @@ fn main() -> Result<()> {
                 "first mismatch at pixel ({x},{y}) channel {ch}: ours={} ref={}",
                 ours[i], refr[i]
             );
+        }
+        return Ok(());
+    }
+
+    // --check <tex> <row> <col>: decode once and print both the ascii-mode cell
+    // average for that cell and the raw pixels, to validate ascii rendering.
+    if let Some(a) = args.iter().position(|x| x == "--check") {
+        let num = |k: usize| args.get(a + k + 1).and_then(|s| s.parse::<usize>().ok());
+        let idx = num(0).unwrap_or(3);
+        let ry = num(1).unwrap_or(76);
+        let rx = num(2).unwrap_or(64);
+        let t = parsed.textures.get(idx).context("texture index out of range")?;
+        let rgba = rustt::dxt::decode(t)?;
+        let w = t.w;
+        let h = t.h;
+        let cols = 128;
+        let rows = (h as f32 * cols as f32 / w as f32) as usize;
+        let x0 = rx * w / cols;
+        let x1 = ((rx + 1) * w + cols - 1) / cols;
+        let y0 = ry * h / rows;
+        let y1 = ((ry + 1) * h + rows - 1) / rows;
+        let mut sa = 0u32;
+        let mut n = 0u32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                sa += rgba[(y * w + x) * 4 + 3] as u32;
+                n += 1;
+            }
+        }
+        println!(
+            "tex {idx} cell({ry},{rx}) x[{x0}..{x1}) y[{y0}..{y1}) avg_a={} ({} px) w={w} h={h} rows={rows}",
+            sa / n.max(1),
+            n
+        );
+        for y in y0..y1 {
+            let mut line = String::new();
+            for x in x0..x1 {
+                let o = (y * w + x) * 4;
+                line.push_str(&format!(
+                    "({:02x}{:02x}{:02x}a{:02x})",
+                    rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3]
+                ));
+            }
+            println!("y={y} {line}");
         }
         return Ok(());
     }
@@ -579,7 +694,7 @@ fn main() -> Result<()> {
     println!("=== materials ===");
     for (i, m) in parsed.materials.iter().enumerate() {
         println!(
-            "mat {i}: id={} tex={} rgba={:02x}{:02x}{:02x}{:02x} diff=({:.2},{:.2},{:.2},{:.2})",
+            "mat {i}: id={} tex={} rgba={:02x}{:02x}{:02x}{:02x} diff=({:.2},{:.2},{:.2},{:.2}) lighting={} defines={:#010x} spec={} norm={} cube={} specExp={:.1} specMult={:.2} refl={:.2} fres=({:.2},{:.2})",
             m.id,
             m.tex_id,
             m.rgba[0],
@@ -589,9 +704,47 @@ fn main() -> Result<()> {
             m.diffuse[0],
             m.diffuse[1],
             m.diffuse[2],
-            m.diffuse[3]
+            m.diffuse[3],
+            match m.lighting_stage {
+                0 => "UNLIT".into(),
+                1 => "LAMBERT".into(),
+                2 => "GOOCH".into(),
+                3 => "ENVMAP".into(),
+                4 => "ANISO".into(),
+                5 => "ANISO_WARD".into(),
+                6 => "PHONG".into(),
+                v => format!("{v}"),
+            },
+            m.shader_defines,
+            if m.tex_specular >= 0 {
+                format!("tex{}", m.tex_specular)
+            } else {
+                "none".into()
+            },
+            if m.tex_normal >= 0 {
+                format!("tex{}", m.tex_normal)
+            } else {
+                "none".into()
+            },
+            if m.tex_cubemap >= 0 {
+                format!("tex{}", m.tex_cubemap)
+            } else {
+                "none".into()
+            },
+            m.specular_params[0],
+            m.specular_params[1],
+            m.reflection_power,
+            m.specular_params[2],
+            m.specular_params[3],
         );
     }
+    println!(
+        "highlight tex: {}",
+        match parsed.highlight_tex {
+            Some(i) => format!("tex {i}"),
+            None => "none".into(),
+        }
+    );
     println!("=== textures ===");
     for (i, t) in parsed.textures.iter().enumerate() {
         let fmt = match t.fmt {

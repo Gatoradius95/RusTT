@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use png::BitDepth;
 
 use crate::dxt;
-use crate::ghg::{Parsed, TextureFmt, uv_offset};
+use crate::ghg::{decode_vertex_layout, Parsed, TextureFmt, uv_offset};
 
 /// Flip textures vertically to convert D3D (top-down) storage to GL/glTF sampling.
 const FLIP_TEXTURE_V: bool = true;
@@ -12,6 +12,19 @@ pub struct MeshData {
     pub pos: Vec<[f32; 3]>,
     pub nrm: Vec<[f32; 3]>,
     pub uv: Vec<[f32; 2]>,
+    /// Lightmap UV set (the material's `LIGHTMAP_UVSET`), raw file values:
+    /// u in [0..1], v in [-1..0], u <= 0 marks the vertex-lit fallback
+    /// (hlsl:825). Empty when the material has no lightmap stage.
+    pub lm_uv: Vec<[f32; 2]>,
+    /// Per-vertex color (RGBA8). Map meshes carry baked lighting here (the
+    /// original multiplies it into the textured surface color); character
+    /// meshes have no file color and fill this with the 127 bake-fill neutral
+    /// (the view shader's vertexColor × 2.0 then maps it to ~1.0 = no-op).
+    pub color: Vec<[u8; 4]>,
+    /// Per-vertex tangent (XYZW as f32, byte4 packed: `(value/255)*2-1`).
+    /// W is handedness (+1/-1) for bitangent computation in the shader.
+    /// Empty when the material has no tangent data.
+    pub tangent: Vec<[f32; 4]>,
     pub idx: Vec<u16>,
     /// Per-vertex skin block, 8 bytes per vertex: 4 weights (u8) followed by
     /// 4 local bone indices (u8; 255 = no influence). Empty when the part
@@ -25,16 +38,20 @@ pub struct MeshData {
 pub fn build_meshes(p: &Parsed) -> Vec<MeshData> {
     let mut out = Vec::with_capacity(p.render.len());
     for item in &p.render {
-        out.push(build_mesh(p, item.part));
+        let vf = p.materials.get(item.mat as usize).map(|m| m.vertex_format_bits).unwrap_or(0);
+        out.push(build_mesh(p, item.part, vf));
     }
     out
 }
 
-pub fn build_mesh(p: &Parsed, part_idx: usize) -> MeshData {
+pub fn build_mesh(p: &Parsed, part_idx: usize, vertex_format_bits: u32) -> MeshData {
     let empty = MeshData {
         pos: Vec::new(),
         nrm: Vec::new(),
         uv: Vec::new(),
+        lm_uv: Vec::new(),
+        color: Vec::new(),
+        tangent: Vec::new(),
         idx: Vec::new(),
         skin: Vec::new(),
         skin_bones: Vec::new(),
@@ -43,6 +60,10 @@ pub fn build_mesh(p: &Parsed, part_idx: usize) -> MeshData {
         Some(x) => x,
         None => return empty,
     };
+    // primitive_type 0 ("None") is used by modded minifigs to hide specific parts.
+    if part.primitive_type == 0 {
+        return empty;
+    }
     if part.num_v == 0 || part.num_i < 3 {
         return empty;
     }
@@ -56,10 +77,14 @@ pub fn build_mesh(p: &Parsed, part_idx: usize) -> MeshData {
         return empty;
     }
     let uvo = uv_offset(part.stride).or_else(|| scan_uv(vl, base, n, part.stride));
+    let vlayout = decode_vertex_layout(vertex_format_bits);
+    // Prefer the decoded tangent offset; fall back to heuristic for MAP vertices.
+    let tao = vlayout.tangent_offset;
 
     let mut pos = Vec::with_capacity(n);
     let mut uv = Vec::with_capacity(n);
     let mut got_uv = false;
+    let mut tangent = Vec::with_capacity(if tao.is_some() { n } else { 0 });
     // Per-vertex skin block offsets: (weights, indices) by stride.
     // Stride 44: [pos 12][nrm 12][pad 4][uv 8][skin 8] -> skin at 36.
     // Stride 40: [pos 12][nrm 12][uv 8][skin 8] -> skin at 32.
@@ -91,6 +116,19 @@ pub fn build_mesh(p: &Parsed, part_idx: usize) -> MeshData {
             }
         } else {
             uv.push([0.0, 0.0]);
+        }
+        if let Some(t) = tao {
+            let to = o + t;
+            if to + 4 <= vl.len() {
+                tangent.push([
+                    (vl[to] as f32 / 255.0) * 2.0 - 1.0,
+                    (vl[to + 1] as f32 / 255.0) * 2.0 - 1.0,
+                    (vl[to + 2] as f32 / 255.0) * 2.0 - 1.0,
+                    (vl[to + 3] as f32 / 255.0) * 2.0 - 1.0,
+                ]);
+            } else {
+                tangent.push([0.0, 0.0, 1.0, 1.0]);
+            }
         }
     }
 
@@ -152,21 +190,67 @@ pub fn build_mesh(p: &Parsed, part_idx: usize) -> MeshData {
             nrm[v][2] += nz;
         }
     }
-    for v in nrm.iter_mut() {
+    // Area-weighted mesh average normal: sane fallback for vertices no real
+    // triangle touched (zero-area slivers, unreferenced verts).
+    let mut avg = [0f32; 3];
+    let mut n_ok = 0usize;
+    for v in &nrm {
         let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
         if l > 1e-12 {
-            v[0] /= l;
-            v[1] /= l;
-            v[2] /= l;
-        } else {
-            *v = [0.0, 1.0, 0.0];
+            avg[0] += v[0] / l;
+            avg[1] += v[1] / l;
+            avg[2] += v[2] / l;
+            n_ok += 1;
         }
     }
+    if n_ok > 0 {
+        let l = (avg[0] * avg[0] + avg[1] * avg[1] + avg[2] * avg[2]).sqrt();
+        if l > 1e-12 {
+            avg = [avg[0] / l, avg[1] / l, avg[2] / l];
+        }
+    }
+    let mut normalized = vec![[0f32; 3]; n];
+    for (vi, v) in nrm.iter().enumerate() {
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if l > 1e-12 {
+            normalized[vi] = [v[0] / l, v[1] / l, v[2] / l];
+        } else {
+            // Prefer a vertex at the same position that real triangles did
+            // touch (twin verts share positions across the mouth band), so
+            // identical positions don't end up with different normals (the
+            // transparent-mesh lift would tear the sheet apart).
+            let mut twin = None;
+            for (m, nm) in nrm.iter().enumerate() {
+                if m == vi
+                    || (pos[m][0] - pos[vi][0]).abs() > 1e-5
+                    || (pos[m][1] - pos[vi][1]).abs() > 1e-5
+                    || (pos[m][2] - pos[vi][2]).abs() > 1e-5
+                {
+                    continue;
+                }
+                let tl = (nm[0] * nm[0] + nm[1] * nm[1] + nm[2] * nm[2]).sqrt();
+                if tl > 1e-6 {
+                    twin = Some([nm[0] / tl, nm[1] / tl, nm[2] / tl]);
+                    break;
+                }
+            }
+            normalized[vi] = twin.unwrap_or(avg);
+        }
+    }
+    nrm = normalized;
     let _ = got_uv;
+    // No file color → fill with the 127 bake-fill neutral: the shader's
+    // unconditional `v_color.rgb * 2.0` (COLOR_FACTOR) then maps 127 → ~0.996,
+    // i.e. the same "no vertex color" (fs_layer0_color = 1.0) the game's
+    // colorless LAMBERT characters get. A 255 fill would double-brighten them.
+    let color = vec![[127u8, 127, 127, 255]; pos.len()];
     MeshData {
         pos,
         nrm,
         uv,
+        lm_uv: Vec::new(),
+        color,
+        tangent,
         idx,
         skin,
         skin_bones: part.skin_bones.iter().map(|&b| b as u16).collect(),

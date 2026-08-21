@@ -1,8 +1,14 @@
 pub mod ai2;
 pub mod an3;
+pub mod anm;
 pub mod bsa;
 pub mod dxt;
 pub mod ghg;
 pub mod glb;
+pub mod giz;
 pub mod map;
+pub mod map_txt;
 pub mod mapmesh;
+pub mod ptl;
+pub mod rtl;
+pub mod scp;

@@ -53,6 +53,98 @@ fn header_fields_are_originalnumframes_and_numframes() {
 }
 
 #[test]
+fn interpolation_is_smooth_with_no_snapping_jumps() {
+    // The game's evaluator linearly interpolates between adjacent decoded
+    // samples (round-to-nearest index + fractional lerp). A snapping sampler
+    // holds each sample and then jumps by a full sample delta at the boundary,
+    // which reads as ~1/30s judder. Verify fine-grained sampling never jumps
+    // by more than a fraction of the largest sample-to-sample delta.
+    for name in ["RUN.AN3", "WALK.AN3", "IDLE.AN3"] {
+        let an3 = parse_anakin(name);
+        let steps_per_sub = 64.0;
+
+        for bone in 0..an3.num_bones {
+            for chan in 0..9 {
+                let max_delta: f32 = (0..an3.data_frames)
+                    .map(|k| {
+                        let a = an3.channel_value(bone, chan, k as f32);
+                        let b = an3.channel_value(bone, chan, k as f32 + 1.0);
+                        (b - a).abs()
+                    })
+                    .fold(0.0, f32::max);
+                if max_delta < 1e-6 {
+                    continue; // static/constant channel
+                }
+
+                // Fine-grained max jump over the whole data range.
+                let n_points = (an3.data_frames as f32 * steps_per_sub) as usize;
+                let mut max_jump = 0.0f32;
+                let mut prev = an3.channel_value(bone, chan, 0.0);
+                for p in 1..=n_points {
+                    let f = p as f32 / steps_per_sub;
+                    let v = an3.channel_value(bone, chan, f);
+                    max_jump = max_jump.max((v - prev).abs());
+                    prev = v;
+                }
+
+                // Interpolated rate is bounded by the slope per subframe; a
+                // snapping sampler would jump by a full sample delta.
+                let slope_budget = max_delta * (1.0 / steps_per_sub) * 2.5;
+                assert!(
+                    max_jump <= slope_budget,
+                    "{name} bone {bone} ch {chan}: max fine jump {max_jump} > slope budget {slope_budget} (max sample delta {max_delta})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn blend_is_endpoint_exact_and_in_between() {
+    use rustt::an3::blended_bone_worlds;
+    let a = parse_anakin("IDLE.AN3");
+    let b = parse_anakin("WALK.AN3");
+    let parents: Vec<i32> = (0..a.num_bones)
+        .map(|i| if i == 0 { -1 } else { 0 })
+        .collect();
+    let rest = vec![glam::Mat4::IDENTITY; a.num_bones];
+    let fa = a.remap_playhead(3.0);
+    let fb = b.remap_playhead(3.0);
+
+    let wa0 = a.bone_worlds(&parents, &rest, fa).expect("a worlds");
+    let wb1 = b.bone_worlds(&parents, &rest, fb).expect("b worlds");
+
+    // t = 0 is exactly clip a, t = 1 exactly clip b.
+    let w0 = blended_bone_worlds(&a, &b, &parents, &rest, fa, fb, 0.0).expect("blend 0");
+    let w1 = blended_bone_worlds(&a, &b, &parents, &rest, fa, fb, 1.0).expect("blend 1");
+    assert!(pose_dist(&w0, &wa0) < 1e-4, "t=0 must match clip a");
+    assert!(pose_dist(&w1, &wb1) < 1e-4, "t=1 must match clip b");
+
+    // Mid-blend pose is finite and strictly between the two endpoints.
+    let w05 = blended_bone_worlds(&a, &b, &parents, &rest, fa, fb, 0.5).expect("blend 0.5");
+    assert_eq!(w05.len(), a.num_bones);
+    for w in &w05 {
+        assert!(w.is_finite(), "non-finite mid-blend world");
+    }
+    let d_ab = pose_dist(&wa0, &wb1);
+    let d_a = pose_dist(&w05, &wa0);
+    let d_b = pose_dist(&w05, &wb1);
+    assert!(d_ab > 0.0, "clips are distinct");
+    assert!(
+        d_a < d_ab * 0.95 && d_b < d_ab * 0.95,
+        "mid-blend pose must sit between the clips (a {d_a}, b {d_b}, ab {d_ab})"
+    );
+
+    // A longer crossfade sweep stays finite across all blend weights.
+    for t in [0.1, 0.25, 0.5, 0.75, 0.9] {
+        let ws = blended_bone_worlds(&a, &b, &parents, &rest, fa, fb, t).expect("blend");
+        for w in &ws {
+            assert!(w.is_finite(), "non-finite blend at t={t}");
+        }
+    }
+}
+
+#[test]
 fn loop_seam_is_seamless_and_no_garbage_at_tail() {
     for name in ["RUN.AN3", "WALK.AN3", "IDLE.AN3"] {
         let an3 = parse_anakin(name);

@@ -6,10 +6,10 @@ pub struct Parsed<'a> {
     pub textures: Vec<Texture>,
     pub parts: Vec<Part>,
     pub render: Vec<RenderItem>,
-    /// Layer index of each render item (parallel to `render`). Layers are
-    /// LOD/quality variants: the game draws only the layers selected by the
-    /// sibling `.TXT` (`layers_special`, `layers_high`, ...).
+    /// Layer index of each render item (parallel to `render`). Layers are LOD/quality variants: the game draws only the layers selected by the sibling `.TXT` (`layers_special`, `layers_high`, ...)
     pub render_layer: Vec<u32>,
+    /// Index of the model's highlight texture
+    pub highlight_tex: Option<usize>,
     pub bones: Vec<Bone>,
     pub vertex_lists: Vec<&'a [u8]>,
     pub index_lists: Vec<&'a [u8]>,
@@ -20,6 +20,24 @@ pub struct Material {
     pub diffuse: [f32; 4],
     pub tex_id: i16,
     pub rgba: [u8; 4],
+    /// Lighting model derived from the MS00 record's `shaderDefines` bits (record +0x26C, decoded like BrickBench `FileMaterial.generateDefines`): 0 = DISABLE (unlit, albedo only), 1 = LAMBERT (diffuse only), 6 = PHONG (Lambert + phong specular), etc.
+    pub lighting_stage: u8,
+    /// Uber Shader 2.0 per-material params (record +0x12C/0x130/0x144/0x148): x = kCosPower (specular exponent), y = kSpecular (intensity), z = kFresnel, w = kFresnelPower.
+    pub specular_params: [f32; 4],
+    /// Raw `shaderDefines` bits (record +0x26C).
+    pub shader_defines: u32,
+    /// Specular-map texture id (record +0xFC), -1 when none.
+    pub tex_specular: i16,
+    /// Normal-map texture id (record +0x100), -1 when none.
+    pub tex_normal: i16,
+    /// Cubemap texture id (record +0x104), -1 when none.
+    pub tex_cubemap: i16,
+    /// Reflection power (record +0xB4+0x78), 0.0 = no reflection.
+    pub reflection_power: f32,
+    /// Vertex format bitfield (record +0x1F0). Controls per-vertex attribute
+    /// layout: tangent type, normal type, UV set count, blend indices/weights
+    /// type, etc.  Decoded by `decode_vertex_layout()`.
+    pub vertex_format_bits: u32,
 }
 
 pub struct Texture {
@@ -36,6 +54,7 @@ pub enum TextureFmt {
 }
 
 pub struct Part {
+    pub primitive_type: u32,
     pub stride: usize,
     pub off_v: usize,
     pub num_v: usize,
@@ -43,13 +62,9 @@ pub struct Part {
     pub num_i: usize,
     pub il: usize,
     pub vl: usize,
-    /// Skin bones from the part descriptor at +0x0a (0xff-terminated, local
-    /// indices into this list appear in the vertex skin block). Empty when the
-    /// part is rigidly bound to a single render-item bone.
+    /// Skin bones from the part descriptor at +0x0a (0xff-terminated, local indices into this list appear in the vertex skin block). Empty when the part is rigidly bound to a single render-item bone.
     pub skin_bones: Vec<u8>,
-    /// Shape keys ("dynamic buffers"): per slot, `num_v` per-vertex [x,y,z]
-    /// offsets from the base pose. `None` for an empty slot (pointer 0).
-    /// Driven by BSA channel weights, one shape per channel (by index).
+    /// Shape keys ("dynamic buffers"): per slot, `num_v` per-vertex [x,y,z] offsets from the base pose. `None` for an empty slot (pointer 0). Driven by BSA channel weights, one shape per channel (by index).
     pub dynamic_buffers: Vec<Option<Vec<[f32; 3]>>>,
 }
 
@@ -64,13 +79,11 @@ pub struct Bone {
     pub parent: i32,
     /// identity matrix (first matrix per bone) — used for AN3 0x20 rotations.
     pub identity: Mat4,
-    /// local matrix (consecutive block after the bone structs) — the model
-    /// rest pose world skeleton.
+    /// local matrix (consecutive block after the bone structs) — the model rest pose world skeleton.
     pub local: Mat4,
     /// identity * local (world) for the model's own bind pose.
     pub world: Mat4,
-    /// the `abs_bones3` world-rest matrix (wide-stance) — the true model
-    /// binding skeleton.
+    /// the `abs_bones3` world-rest matrix (wide-stance)
     pub bind: Mat4,
 }
 
@@ -99,6 +112,30 @@ fn rel(d: &[u8], q: i64) -> Result<i64> {
 fn check_range(d: &[u8], o: usize, n: usize) -> Result<()> {
     ensure!(o + n <= d.len(), "read past end (offset {o:#x}, len {n})");
     Ok(())
+}
+
+/// Map the MS00 record's `shaderDefines` bits (record +0x26C) to the uber shader lighting-stage enum (0=DISABLE 1=LAMBERT 2=GOOCH 3=ENVMAP 4=ANISO 5=ANISO_WARD 6=PHONG), matching BrickBench `FileMaterial.generateDefines()`.
+pub fn lighting_stage_from_defines(defines: u32) -> u8 {
+    if defines & 0x1000 != 0 {
+        // Prelit (baked lightmap) path: bit 0x1000 set.
+        if defines & 0x8000_0000 == 0 {
+            0 // DISABLE
+        } else if defines & 0x8 != 0 {
+            6 // PHONG (with PRELIGHT_FX_LIVE_SPECULAR)
+        } else {
+            1 // LAMBERT
+        }
+    } else if defines & 0x2_0000 != 0 {
+        2 // GOOCH
+    } else if defines & 0x8_0000 != 0 {
+        3 // ENVMAP
+    } else if defines & 0x10 != 0 {
+        4 // ANISO
+    } else if defines & 0x8 != 0 {
+        6 // PHONG
+    } else {
+        1 // LAMBERT
+    }
 }
 
 pub fn parse(data: &[u8]) -> Result<Parsed<'_>> {
@@ -172,11 +209,33 @@ pub fn parse(data: &[u8]) -> Result<Parsed<'_>> {
         let tex_id = i16::from_le_bytes(data[q..q + 2].try_into().unwrap());
         q += 2 + 0x52;
         let rgba = [data[q], data[q + 1], data[q + 2], data[q + 3]];
+        // Remaining fields are at absolute record offsets (BrickBench reads the material at record + 0xB4):
+        //   +0xFC specular-map tex id, +0x100 normal-map tex id
+        //   +0x12C kSpecular, +0x130 kCosPower, +0x144 kFresnel, +0x148 kFresnelPower
+        //   +0x26C shaderDefines
+        let tex_specular = i16::from_le_bytes(data[p + 0xfc..p + 0xfe].try_into().unwrap());
+        let tex_normal = i16::from_le_bytes(data[p + 0x100..p + 0x102].try_into().unwrap());
+        let tex_cubemap = i16::from_le_bytes(data[p + 0x104..p + 0x106].try_into().unwrap());
+        let reflection_power = f32::from_le_bytes(data[p + 0x12c..p + 0x130].try_into().unwrap());
+        let spec_exp = f32::from_le_bytes(data[p + 0x130..p + 0x134].try_into().unwrap());
+        let fres_mult = f32::from_le_bytes(data[p + 0x144..p + 0x148].try_into().unwrap());
+        let fres_coeff = f32::from_le_bytes(data[p + 0x148..p + 0x14c].try_into().unwrap());
+        let shader_defines = at_u32(data, p + 0x26c);
+        let lighting_stage = lighting_stage_from_defines(shader_defines);
+        let vertex_format_bits = at_u32(data, p + 0x1f0);
         materials.push(Material {
             id,
             diffuse,
             tex_id,
             rgba,
+            lighting_stage,
+            specular_params: [spec_exp, reflection_power, fres_mult, fres_coeff],
+            shader_defines,
+            tex_specular,
+            tex_normal,
+            tex_cubemap,
+            reflection_power,
+            vertex_format_bits,
         });
         p += 0x38 + 4 + 0x18 + 16 + 0x10 + 2 + 0x52 + 4 + 0x1f8;
     }
@@ -288,6 +347,7 @@ pub fn parse(data: &[u8]) -> Result<Parsed<'_>> {
         let desc = part_pos as i64 + offset_part;
         let desc = usize::try_from(desc).context("negative part descriptor offset")?;
         check_range(data, desc, 0x30)?;
+        let primitive_type = at_u32(data, desc);
         let num_i = at_i32(data, desc + 4) + 2;
         let stride = at_u16(data, desc + 8) as usize;
         let off_v = at_i32(data, desc + 0x14) as usize;
@@ -314,6 +374,7 @@ pub fn parse(data: &[u8]) -> Result<Parsed<'_>> {
         let dynamic_buffers = parse_dynamic_buffers(data, desc, num_v)?;
         ensure!(num_i >= 2, "part has fewer than 2 indices");
         parts.push(Part {
+            primitive_type,
             stride,
             off_v,
             num_v,
@@ -406,12 +467,30 @@ pub fn parse(data: &[u8]) -> Result<Parsed<'_>> {
         }
     }
 
+    // Highlight/glint texture: the model-level texture the engine binds on
+    // top of Phong specular. It is not referenced by any material slot, and
+    // the shared lens-flare assets are DXT1 (opaque) and at least 32px.
+    let mut referenced = std::collections::HashSet::new();
+    for m in &materials {
+        for id in [m.tex_id, m.tex_specular, m.tex_normal] {
+            if id >= 0 {
+                referenced.insert(id as usize);
+            }
+        }
+    }
+    let highlight_tex = textures
+        .iter()
+        .enumerate()
+        .find(|(i, t)| !referenced.contains(i) && t.fmt == TextureFmt::Dxt1 && t.w >= 32)
+        .map(|(i, _)| i);
+
     Ok(Parsed {
         materials,
         textures,
         parts,
         render,
         render_layer,
+        highlight_tex,
         bones,
         vertex_lists,
         index_lists,
@@ -535,5 +614,100 @@ pub fn uv_offset(stride: usize) -> Option<usize> {
         36 => Some(28),
         32 => Some(24),
         _ => None,
+    }
+}
+
+/// Decoded per-vertex attribute layout from a GHG material's
+/// `vertex_format_bits` field (+0x1F0). Mirrors BactaTank Classic's
+/// `decodeVertexFormat()`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VertexLayout {
+    /// Byte offset of the tangent attribute (4 bytes, byte4 packed as
+    /// `[(value/255)*2-1; 4]`). `None` when the material has no tangent.
+    pub tangent_offset: Option<usize>,
+    /// Byte offset of the UV (diffuse set 0).
+    pub uv_offset: Option<usize>,
+}
+
+pub fn decode_vertex_layout(vf: u32) -> VertexLayout {
+    // Normal type: 0 = none, 1 = float3, 2 = byte4
+    let normal_type = if (vf & 8) == 0 && (vf & 0x88_0000) == 0 {
+        (vf >> 2) & 1
+    } else {
+        2
+    };
+    // Tangent type: 0 = none, 1 = float3, 2 = byte4
+    let tangent_type = if (vf & 0x20) == 0 && (vf & 0x100_0000) == 0 {
+        (vf >> 4) & 1
+    } else {
+        2
+    };
+    // Bitangent type: 0 = none, 1 = float3, 2 = byte4
+    let bitangent_type = if (vf as i32) < 0 || (vf & 0x200_0000) != 0 {
+        2
+    } else {
+        (vf >> 6) & 1
+    };
+
+    let colour_set1 = (vf >> 8) & 1;
+    let colour_set2 = vf & 0x600;
+
+    let uv_count;
+    let half_float_uv;
+    if (vf >> 0x1b) & 1 == 0 {
+        uv_count = (vf >> 0xb) & 7;
+        half_float_uv = false;
+    } else {
+        uv_count = 0;
+        half_float_uv = true;
+    }
+
+    // Walk the layout starting after position (always float3 at 0x00).
+    let mut offset: usize = 0x0c;
+
+    match normal_type {
+        1 => offset += 0x0c, // float3
+        2 => offset += 0x04, // byte4
+        _ => {}
+    }
+
+    let tangent_offset = match tangent_type {
+        1 => {
+            let o = offset;
+            offset += 0x0c;
+            Some(o)
+        }
+        2 => {
+            let o = offset;
+            offset += 0x04;
+            Some(o)
+        }
+        _ => None,
+    };
+
+    match bitangent_type {
+        1 => offset += 0x0c,
+        2 => offset += 0x04,
+        _ => {}
+    }
+
+    if colour_set1 != 0 {
+        offset += 0x04;
+    }
+    if colour_set2 != 0 {
+        offset += 0x04;
+    }
+
+    let uv_offset_val = if uv_count != 0 {
+        Some(offset)
+    } else if half_float_uv {
+        Some(offset) // half-float UVs at same offset
+    } else {
+        None
+    };
+
+    VertexLayout {
+        tangent_offset,
+        uv_offset: uv_offset_val,
     }
 }

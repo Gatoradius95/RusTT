@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target
+
+# Game data (copyrighted - DO NOT commit)
+/Lego Star Wars/
+/backup/
+
+# Extracted textures and debug dumps
+/79/
+/lmtex/
+/tex_out/
+/texdump/
+/out/
+/shots/
+
+# Research (third-party tools with their own repos)
+/research/
+
+# Scratch/debug files
+*.py
+*.txt
+tore --staged *
+
+# OS junk
+Thumbs.db
+Desktop.ini

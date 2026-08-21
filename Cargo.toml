@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "rustt"
 version = "0.1.0"
 edition = "2024"
@@ -41,3 +41,27 @@ path = "src/bin/ai2dump.rs"
 [[bin]]
 name = "game"
 path = "src/bin/game/main.rs"
+
+[[bin]]
+name = "dbg_vcol"
+path = "src/bin/dbg_vcol.rs"
+
+[[bin]]
+name = "dbg_mats"
+path = "src/bin/dbg_mats.rs"
+
+[[bin]]
+name = "dbg_sim"
+path = "src/bin/dbg_sim.rs"
+
+[[bin]]
+name = "dbg_prelit0"
+path = "src/bin/dbg_prelit0.rs"
+
+[[bin]]
+name = "dbg_pix"
+path = "src/bin/dbg_pix.rs"
+
+[[bin]]
+name = "dbg_ascii"
+path = "src/bin/dbg_ascii.rs"
