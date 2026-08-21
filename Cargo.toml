@@ -1,0 +1,43 @@
+[package]
+name = "rustt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+bytemuck = "1.25.2"
+glam = "0.33.3"
+imgui = "0.12"
+imgui-wgpu = "0.28"
+imgui-winit-support = "0.13"
+png = "0.17"
+pollster = "1.0.1"
+wgpu = "29"
+winit = "0.30.13"
+
+[dev-dependencies]
+naga = "29"
+
+[[bin]]
+name = "rustt"
+path = "src/bin/convert.rs"
+
+[[bin]]
+name = "viewer"
+path = "src/bin/viewer/main.rs"
+
+[[bin]]
+name = "bsa_dump"
+path = "src/bin/bsa_dump.rs"
+
+[[bin]]
+name = "mapdump"
+path = "src/bin/mapdump.rs"
+
+[[bin]]
+name = "ai2dump"
+path = "src/bin/ai2dump.rs"
+
+[[bin]]
+name = "game"
+path = "src/bin/game/main.rs"
